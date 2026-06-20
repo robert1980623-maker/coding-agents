@@ -1,0 +1,1 @@
+# Coding Agents Research\n\n研究 Claude Code 和 Codex 的内部配置，特别是 subprocess buffer size 限制。\n\n## 目标\n- 找到 max buffer size 配置方式\n- 调整到 8MB 避免长任务被 kill\n\n## 目录\n- research/ — 调研笔记\n- scripts/ — 测试脚本\n- docs/ — 文档
