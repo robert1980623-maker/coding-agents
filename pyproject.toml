@@ -12,6 +12,7 @@ dependencies = [
     "uvicorn[standard]>=0.32.0",
     "sse-starlette>=2.0.0",
     "prometheus-client>=0.21.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

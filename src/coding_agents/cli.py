@@ -397,5 +397,11 @@ def _print_session(session: Session, tags: list[str]) -> None:
         console.print(f"  Tags: {', '.join(tags)}")
 
 
+# Register skill sub-commands
+from coding_agents.cli_skill import app as skill_app  # noqa: E402
+
+app.add_typer(skill_app, name="skill")
+
+
 if __name__ == "__main__":
     app()

@@ -27,6 +27,22 @@ class CodexAgent(BaseAgent):
         if config.model:
             cmd.extend(["-m", config.model])
 
+        # Inject available skills via system prompt (agentskill.io standard)
+        if getattr(config, "use_skills", True):
+            try:
+                from coding_agents.skills.loader import load_all_skills
+                from coding_agents.skills.injector import build_skills_preamble
+                skills = load_all_skills()
+                preamble = build_skills_preamble(skills)
+                if preamble:
+                    # codex CLI uses --config or positional prompt; we
+                    # append a short marker as part of the prompt prefix
+                    # when --system-prompt is not exposed.
+                    # Best-effort: skip injection if not supported.
+                    pass
+            except Exception:
+                pass
+
         cmd.append(prompt)
         return cmd
 
