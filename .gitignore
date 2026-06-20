@@ -7,3 +7,10 @@ node_modules/
 *.swo
 .idea/
 .vscode/
+.venv/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
