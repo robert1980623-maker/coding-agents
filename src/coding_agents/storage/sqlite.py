@@ -106,40 +106,51 @@ class SQLiteStorage:
     async def create_session(self, session: Session) -> str:
         conn = await self._get_conn()
         now_ts = datetime.now(timezone.utc).timestamp()
-        await asyncio.to_thread(
-            conn.execute,
-            """
-            INSERT INTO sessions (id, agent, prompt, workdir, status, pid, exit_code,
-                started_at, finished_at, duration_ms, last_heartbeat_at,
-                cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                model, provider, metadata, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                session.id,
-                session.agent.value if isinstance(session.agent, AgentType) else session.agent,
-                session.prompt,
-                session.workdir,
-                session.status.value if isinstance(session.status, SessionStatus) else session.status,
-                session.pid,
-                session.exit_code,
-                _dt_to_ts(session.started_at),
-                _dt_to_ts(session.finished_at),
-                session.duration_ms,
-                _dt_to_ts(session.last_heartbeat_at),
-                session.cost_usd,
-                session.input_tokens,
-                session.output_tokens,
-                session.cache_read_tokens,
-                session.cache_write_tokens,
-                session.model,
-                session.provider,
-                _dict_to_json(session.metadata),
-                _dt_to_ts(session.created_at) or now_ts,
-                _dt_to_ts(session.updated_at) or now_ts,
-            ),
-        )
-        await asyncio.to_thread(conn.commit)
+        # Hold self._lock across both execute and commit so concurrent
+        # parallel callers (e.g. multiple run_flow tasks gathered together)
+        # cannot interleave their writes on the shared sqlite3.Connection.
+        # Without this, asyncio.to_thread can dispatch two INSERTs onto
+        # different threads simultaneously, triggering "bad parameter or
+        # other API misuse" / "Recursive use of cursors not allowed" from
+        # SQLite. All other write methods (update_session, add_tag,
+        # create_event, …) already take this lock; this method was the
+        # outlier and the source of flakiness in tests with parallel
+        # task creation (e.g. test_complex_dag_topological_order).
+        async with self._lock:
+            await asyncio.to_thread(
+                conn.execute,
+                """
+                INSERT INTO sessions (id, agent, prompt, workdir, status, pid, exit_code,
+                    started_at, finished_at, duration_ms, last_heartbeat_at,
+                    cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                    model, provider, metadata, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session.id,
+                    session.agent.value if isinstance(session.agent, AgentType) else session.agent,
+                    session.prompt,
+                    session.workdir,
+                    session.status.value if isinstance(session.status, SessionStatus) else session.status,
+                    session.pid,
+                    session.exit_code,
+                    _dt_to_ts(session.started_at),
+                    _dt_to_ts(session.finished_at),
+                    session.duration_ms,
+                    _dt_to_ts(session.last_heartbeat_at),
+                    session.cost_usd,
+                    session.input_tokens,
+                    session.output_tokens,
+                    session.cache_read_tokens,
+                    session.cache_write_tokens,
+                    session.model,
+                    session.provider,
+                    _dict_to_json(session.metadata),
+                    _dt_to_ts(session.created_at) or now_ts,
+                    _dt_to_ts(session.updated_at) or now_ts,
+                ),
+            )
+            await asyncio.to_thread(conn.commit)
         return session.id
 
     async def get_session(self, session_id: str) -> Optional[Session]:
