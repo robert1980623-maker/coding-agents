@@ -1,8 +1,8 @@
 # Coding Agent Runtime — 完整设计文档
 
-> **版本**: v1.0.0  
+> **版本**: v1.1.0  
 > **日期**: 2026-06-20  
-> **状态**: Draft
+> **状态**: Draft (Revised)
 
 ## 1. 概述
 
@@ -25,6 +25,7 @@
 | **协议驱动** | 基于 Protocol 的鸭子类型，无需继承 |
 | **零依赖** | 核心库不依赖 Hermes/OpenClaw 框架 |
 | **渐进增强** | 基础功能零配置，高级功能按需启用 |
+| **简单优先** | v1.0 架构从简，避免过度设计 |
 
 ### 1.3 使用场景
 
@@ -36,44 +37,65 @@
 | **多 Agent 编排** | 并行执行多个 agent，统一监控 |
 | **历史搜索** | 语义搜索过去的执行记录 |
 
+### 1.4 关键设计决策
+
+#### 为什么选 Python？
+
+| 选项 | 优势 | 劣势 | 选择 |
+|------|------|------|------|
+| **Python** | 生态丰富、asyncio 成熟、与 Hermes/memorix 同栈 | 性能不如 Go/Rust | ✅ |
+| Go | 性能优秀、并发模型好 | 与现有栈不匹配、学习成本 | ❌ |
+| Rust | 性能最佳、内存安全 | 开发慢、团队经验少 | ❌ |
+| Node.js | 与 Claude Code (Bun) 同生态 | 与 Hermes 栈不匹配 | ❌ |
+
+**结论**：Python 是最佳选择，因为：
+1. 与 Hermes/memorix 同栈，集成自然
+2. asyncio 足够处理 subprocess 流式 IO
+3. 团队熟悉，开发效率高
+
+#### 为什么不用现有 Agent Runtime？
+
+| 项目 | 定位 | 问题 |
+|------|------|------|
+| **LangGraph** | LLM 编排框架 | 太重，我们是 subprocess 管理 |
+| **CrewAI** | 多 Agent 协作 | 面向 LLM API，不是 CLI agent |
+| **AutoGen** | 多 Agent 对话 | 同上 |
+| **Aider** | 单一 coding agent | 不是 runtime，是应用 |
+
+**结论**：现有项目都不解决"统一管理多个 CLI coding agent"的问题。
+
 ---
 
 ## 2. 架构设计
 
-### 2.1 分层架构
+### 2.1 v1.0 简化架构（3 层）
 
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                    Interface Layer                       │
-│  CLI  │  HTTP Server  │  stdio JSON  │  Python SDK      │
-├─────────────────────────────────────────────────────────┤
-│                    Orchestrator                          │
-│  Session Manager  │  Agent Router  │  Event Bus         │
+│  CLI  │  HTTP Server  │  Python SDK  │  Node.js SDK     │
 ├─────────────────────────────────────────────────────────┤
 │                    Executor Layer                        │
-│  Stream Executor  │  Process Pool  │  Error Recovery    │
-├─────────────────────────────────────────────────────────┤
-│                    Agent Layer                           │
-│  BaseAgent  │  ClaudeAgent  │  CodexAgent  │  Custom    │
+│  Stream Executor  │  Agent Adapters  │  Process Pool    │
 ├─────────────────────────────────────────────────────────┤
 │                    Storage Layer                         │
-│  StorageBackend  │  SQLite  │  Postgres  │  Memory      │
-├─────────────────────────────────────────────────────────┤
-│                    Embedding Layer (Optional)            │
-│  Embedder  │  LMStudio  │  OpenAI  │  SentenceTransform │
+│  StorageBackend (Protocol)  │  SQLite  │  Postgres      │
 └─────────────────────────────────────────────────────────┘
 ```
+
+**v1.0 不包含**（后续版本考虑）：
+- ~~Orchestrator 层~~ — 初期不需要复杂的会话编排
+- ~~Event Bus~~ — 简单回调足够
+- ~~Embedding Layer~~ — 向量搜索作为可选插件，不是核心层
 
 ### 2.2 核心组件
 
 | 组件 | 职责 | 关键特性 |
 |------|------|---------|
-| **Interface** | 对外接口 | CLI/HTTP/stdio/SDK，统一事件格式 |
-| **Orchestrator** | 会话编排 | 生命周期管理、agent 路由、事件分发 |
-| **Executor** | 进程执行 | 流式 subprocess、8MiB buffer、崩溃恢复 |
+| **Interface** | 对外接口 | CLI/HTTP/SDK，统一事件格式 |
+| **Executor** | 进程执行 | 流式 subprocess、8MiB buffer、stderr drain |
 | **Agent** | Agent 适配 | 命令构建、输出解析、成本提取 |
-| **Storage** | 数据持久化 | 批量写入、WAL 模式、向量搜索 |
-| **Embedding** | 语义索引 | 可选，用于事件语义搜索 |
+| **Storage** | 数据持久化 | 批量写入、WAL 模式、全文搜索 |
 
 ### 2.3 数据流
 
@@ -82,20 +104,21 @@ User Request
     │
     ▼
 ┌──────────────┐
-│  Interface   │ ← 统一入口
+│  Interface   │ ← 统一入口 (CLI/HTTP/SDK)
 └──────┬───────┘
        │
        ▼
 ┌──────────────┐
-│ Orchestrator │ ← 创建 session, 路由到 agent
+│   Executor   │ ← 创建 session, 启动 subprocess
 └──────┬───────┘
        │
        ├──────────────┐
        │              │
        ▼              ▼
 ┌──────────────┐  ┌──────────────┐
-│   Executor   │  │   Storage    │
-│  (subprocess)│  │  (SQLite)    │
+│  Subprocess  │  │   Storage    │
+│  (claude/    │  │  (SQLite)    │
+│   codex)     │  │              │
 └──────┬───────┘  └──────▲───────┘
        │                 │
        │  stream events  │
@@ -103,7 +126,7 @@ User Request
               │
               ▼
        ┌──────────────┐
-       │  Event Bus   │ ← 分发到多个消费者
+       │   Callback   │ ← 分发到多个消费者
        └──────┬───────┘
               │
     ┌─────────┼─────────┐
@@ -111,6 +134,25 @@ User Request
     ▼         ▼         ▼
   stdout    file     webhook
 ```
+
+### 2.4 与 memorix 的关系
+
+**明确声明**：本项目**借鉴** memorix 的设计模式，但**不直接复用**其代码。
+
+| 方面 | memorix | coding-agents |
+|------|---------|---------------|
+| **定位** | Agent 记忆层 | Coding agent 执行层 |
+| **数据模型** | Observation + Topic | Session + Event |
+| **存储** | SQLite + sqlite-vec | SQLite (可选 sqlite-vec) |
+| **Embedder** | 核心功能 | 可选插件 |
+
+**借鉴的设计**：
+- Protocol-based 存储接口
+- SQLite PRAGMA 优化（WAL、mmap）
+- 批量写入模式
+- 迁移系统
+
+**未来可能**：如果语义搜索需求强烈，可以考虑集成 memorix 的 embedder。
 
 ---
 
@@ -188,21 +230,14 @@ class Event:
     type: EventType = EventType.STDOUT
     data: str = ""
     
-    # 可选：向量嵌入
-    embedding: Optional[list[float]] = None
+    # 可选：原始 JSON（透传模式）
+    raw_json: Optional[str] = None
     
     # 时间戳
     created_at: datetime = field(default_factory=datetime.now)
     
     # 元数据
     metadata: dict[str, Any] = field(default_factory=dict)
-
-@dataclass
-class WatchPattern:
-    """监控模式"""
-    pattern: str
-    action: str = "notify"           # notify | callback | stop
-    callback: Optional[str] = None   # webhook URL or function name
 
 @dataclass
 class ExecutionConfig:
@@ -220,7 +255,10 @@ class ExecutionConfig:
     retry_delay_seconds: int = 5
     
     # 监控
-    watch_patterns: list[WatchPattern] = field(default_factory=list)
+    watch_patterns: list[str] = field(default_factory=list)
+    
+    # 输出模式
+    output_mode: str = "standard"    # "passthrough" | "standard"
     
     # 环境变量
     env: dict[str, str] = field(default_factory=dict)
@@ -229,7 +267,7 @@ class ExecutionConfig:
 ### 3.2 SQLite Schema
 
 ```sql
--- 基于 memorix 的存储设计
+-- 基于 memorix 风格的存储设计
 
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -278,27 +316,26 @@ CREATE TABLE IF NOT EXISTS events (
     seq INTEGER NOT NULL,
     type TEXT NOT NULL,
     data TEXT NOT NULL,
-    embedding BLOB,  -- float32 数组，可选
+    raw_json TEXT,  -- 原始 JSON（透传模式）
     metadata TEXT DEFAULT '{}',
     created_at REAL NOT NULL DEFAULT (strftime('%s', 'now')),
     
     UNIQUE(session_id, seq)
 );
 
+-- 全文搜索索引（可选）
+CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+    data, content=events, content_rowid=id
+);
+
 -- 索引优化
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent);
 CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_sessions_tags ON sessions(tags);
 
 CREATE INDEX IF NOT EXISTS idx_events_session_seq ON events(session_id, seq);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
 CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);
-
--- 向量搜索（可选，需要 sqlite-vec）
--- CREATE VIRTUAL TABLE IF NOT EXISTS events_vec USING vec0(
---     embedding float[1024]
--- );
 
 -- 迁移版本追踪
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -309,30 +346,47 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 ### 3.3 统一事件格式
 
-所有接口层输出统一的事件格式：
+**双模式设计**：
+
+#### 模式 1: 标准化模式（默认）
+
+提取关键字段，丢失部分细节：
 
 ```jsonl
 // 会话开始
 {"type":"session.start","session_id":"uuid","agent":"claude","prompt":"...","timestamp":1234567890}
 
-// 标准输出
+// 标准输出（提取文本内容）
 {"type":"stdout","session_id":"uuid","seq":1,"data":"...","timestamp":1234567890}
 
 // 标准错误
 {"type":"stderr","session_id":"uuid","seq":2,"data":"...","timestamp":1234567890}
 
-// 系统事件
-{"type":"system","session_id":"uuid","subtype":"init","data":{...},"timestamp":1234567890}
-
-// 监控匹配
-{"type":"watch","session_id":"uuid","pattern":"passed","line":"...","timestamp":1234567890}
-
-// 会话结束
+// 会话结束（提取成本）
 {"type":"session.end","session_id":"uuid","status":"completed","exit_code":0,"duration_ms":5000,"cost_usd":0.15,"timestamp":1234567890}
-
-// 错误
-{"type":"error","session_id":"uuid","code":"TIMEOUT","message":"...","timestamp":1234567890}
 ```
+
+#### 模式 2: 透传模式
+
+原样输出 agent 的 JSON，保留所有细节：
+
+```jsonl
+// Claude Code stream-json 原样输出
+{"type":"system","subtype":"init","cwd":"/path","session_id":"...","tools":["Bash","Edit",...]}
+{"type":"system","subtype":"thinking_tokens","estimated_tokens":100}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Hello!"}]}}
+{"type":"result","subtype":"success","total_cost_usd":0.15,...}
+
+// Codex --json 原样输出
+{"type":"thread.started","thread_id":"..."}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"type":"agent_message","text":"Hi!"}}
+{"type":"turn.completed","usage":{"input_tokens":100}}
+```
+
+**使用场景**：
+- **标准化模式**：简单集成、日志收集、监控
+- **透传模式**：需要完整信息（如 thinking tokens、tool calls）
 
 ---
 
@@ -409,6 +463,7 @@ class StreamExecutor:
                     seq=seq,
                     type=EventType.STDOUT,
                     data=line.decode(),
+                    raw_json=line.decode() if self.config.output_mode == "passthrough" else None,
                 )
                 
                 # 写入 buffer
@@ -472,14 +527,9 @@ class StreamExecutor:
     async def _check_watch_patterns(self, session_id: str, event: Event):
         """检查监控模式"""
         for pattern in self.config.watch_patterns:
-            if pattern.pattern in event.data:
-                # 触发 action
-                if pattern.action == "notify":
-                    # 发送通知
-                    pass
-                elif pattern.action == "stop":
-                    # 停止执行
-                    await self.kill(session_id)
+            if pattern in event.data:
+                # 触发回调（如果有）
+                pass
     
     async def kill(self, session_id: str):
         """终止进程"""
@@ -499,7 +549,7 @@ class StreamExecutor:
 # agents/base.py
 
 from abc import ABC, abstractmethod
-from typing import AsyncIterator
+from typing import Optional
 
 class BaseAgent(ABC):
     """Agent 抽象基类"""
@@ -628,7 +678,7 @@ class CodexAgent(BaseAgent):
 
 ### 4.3 Storage — Protocol 设计
 
-**设计**：基于 memorix 的 `StorageBackend` Protocol，支持多种实现。
+**设计**：基于 Protocol 的鸭子类型，支持多种实现。
 
 ```python
 # storage/base.py
@@ -694,108 +744,6 @@ class StorageBackend(Protocol):
     ) -> list[Event]:
         """搜索事件（全文或向量）"""
         ...
-
-# storage/sqlite.py
-
-import aiosqlite
-import json
-from pathlib import Path
-
-class SQLiteStorage:
-    """SQLite 存储实现"""
-    
-    def __init__(self, db_path: str):
-        self.db_path = Path(db_path)
-        self._conn: Optional[aiosqlite.Connection] = None
-        self._batch_buffer: list[tuple] = []
-    
-    async def initialize(self) -> None:
-        """初始化数据库"""
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        self._conn = await aiosqlite.connect(str(self.db_path))
-        
-        # 性能优化 PRAGMA
-        await self._conn.execute("PRAGMA journal_mode=WAL")
-        await self._conn.execute("PRAGMA synchronous=NORMAL")
-        await self._conn.execute("PRAGMA busy_timeout=5000")
-        await self._conn.execute("PRAGMA mmap_size=268435456")
-        await self._conn.execute("PRAGMA foreign_keys=ON")
-        
-        # 创建表
-        await self._conn.executescript(SCHEMA_SQL)
-        await self._conn.commit()
-    
-    async def close(self) -> None:
-        """关闭连接"""
-        if self._conn:
-            await self._conn.close()
-    
-    async def create_session(self, session: Session) -> str:
-        """创建会话"""
-        await self._conn.execute(
-            """INSERT INTO sessions 
-               (id, agent, prompt, workdir, status, metadata, tags)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                session.id,
-                session.agent.value,
-                session.prompt,
-                session.workdir,
-                session.status.value,
-                json.dumps(session.metadata),
-                json.dumps(session.tags),
-            )
-        )
-        await self._conn.commit()
-        return session.id
-    
-    async def append_events(self, events: list[Event]) -> list[int]:
-        """批量追加事件"""
-        rows = [
-            (
-                e.session_id,
-                e.seq,
-                e.type.value,
-                e.data,
-                json.dumps(e.metadata),
-            )
-            for e in events
-        ]
-        
-        await self._conn.executemany(
-            """INSERT INTO events (session_id, seq, type, data, metadata)
-               VALUES (?, ?, ?, ?, ?)""",
-            rows
-        )
-        await self._conn.commit()
-        
-        # 返回 ID（简化：假设自增）
-        return list(range(1, len(events) + 1))
-    
-    async def stream_events(
-        self,
-        session_id: str,
-        after_seq: int = 0,
-    ) -> AsyncIterator[Event]:
-        """流式读取事件"""
-        async with self._conn.execute(
-            """SELECT id, session_id, seq, type, data, metadata, created_at
-               FROM events
-               WHERE session_id = ? AND seq > ?
-               ORDER BY seq""",
-            (session_id, after_seq)
-        ) as cursor:
-            async for row in cursor:
-                yield Event(
-                    id=row[0],
-                    session_id=row[1],
-                    seq=row[2],
-                    type=EventType(row[3]),
-                    data=row[4],
-                    metadata=json.loads(row[5]),
-                    created_at=datetime.fromtimestamp(row[6]),
-                )
 ```
 
 ---
@@ -824,9 +772,6 @@ coding-agent search "重构" --agent claude --last 7d
 
 # 列出会话
 coding-agent list --agent claude --status completed --limit 20
-
-# 回放事件
-coding-agent replay <session_id> --from-seq 100
 
 # 终止执行
 coding-agent kill <session_id>
@@ -894,7 +839,7 @@ async for event in agent.run_stream(
 # 查询历史
 sessions = await agent.list_sessions(agent="claude", limit=10)
 
-# 语义搜索
+# 搜索历史
 results = await agent.search_events("重构", agent="claude", limit=20)
 ```
 
@@ -933,9 +878,174 @@ const agent = new CodingAgent({
 
 ---
 
-## 6. 性能设计
+## 6. 集成示例
 
-### 6.1 内存优化
+### 6.1 Hermes 集成
+
+#### 方式 1: 作为 Hermes Tool
+
+```python
+# tools/coding_agent_tool.py
+
+import json
+from tools.registry import registry
+from coding_agents import CodingAgent, SQLiteStorage
+
+async def coding_agent_tool(
+    agent: str,
+    prompt: str,
+    workdir: str = ".",
+    background: bool = False,
+) -> str:
+    """调用 coding agent (Claude Code / Codex)"""
+    
+    storage = SQLiteStorage("~/.coding-agents/data.db")
+    ca = CodingAgent(storage=storage)
+    
+    if background:
+        # 后台执行
+        session = await ca.run_background(
+            agent=agent,
+            prompt=prompt,
+            workdir=workdir,
+        )
+        return json.dumps({"session_id": session.id, "status": "started"})
+    else:
+        # 前台执行，收集输出
+        output = []
+        async for event in ca.run_stream(
+            agent=agent,
+            prompt=prompt,
+            workdir=workdir,
+        ):
+            if event.type == "stdout":
+                output.append(event.data)
+        
+        return "".join(output)
+
+registry.register(
+    name="coding_agent",
+    toolset="coding",
+    schema={
+        "name": "coding_agent",
+        "description": "Call Claude Code or Codex to execute coding tasks",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string", "enum": ["claude", "codex"]},
+                "prompt": {"type": "string"},
+                "workdir": {"type": "string", "default": "."},
+                "background": {"type": "boolean", "default": False},
+            },
+            "required": ["agent", "prompt"],
+        },
+    },
+    handler=lambda args, **kw: coding_agent_tool(
+        agent=args["agent"],
+        prompt=args["prompt"],
+        workdir=args.get("workdir", "."),
+        background=args.get("background", False),
+    ),
+)
+```
+
+#### 方式 2: 直接调用 CLI
+
+```python
+# 在 Hermes 中直接调用
+result = terminal('coding-agent run claude "重构函数" --workdir ~/project')
+```
+
+### 6.2 OpenClaw 集成
+
+#### 方式 1: HTTP API
+
+```javascript
+// OpenClaw agent 调用 coding-agent
+const response = await fetch('http://localhost:8080/api/v1/run', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    agent: 'claude',
+    prompt: '重构函数',
+    workdir: '/path/to/project',
+  }),
+});
+
+const { session_id } = await response.json();
+
+// 订阅事件流
+const eventSource = new EventSource(
+  `http://localhost:8080/api/v1/sessions/${session_id}/events?stream=true`
+);
+
+eventSource.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  if (data.type === 'stdout') {
+    console.log(data.data);
+  }
+};
+```
+
+#### 方式 2: Node.js SDK
+
+```javascript
+import { CodingAgent } from 'coding-agents';
+
+const agent = new CodingAgent();
+
+// 在 OpenClaw agent 中
+const session = await agent.run({
+  agent: 'claude',
+  prompt: '重构函数',
+  workdir: '/path/to/project',
+});
+
+console.log(`Completed: ${session.status}`);
+```
+
+### 6.3 CI/CD 集成
+
+```yaml
+# .github/workflows/coding-agent.yml
+
+name: Coding Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: 'Task description'
+        required: true
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install coding-agents
+        run: pip install coding-agents
+      
+      - name: Run Claude Code
+        run: |
+          coding-agent run claude "${{ github.event.inputs.task }}" \
+            --workdir . \
+            --output json \
+            > result.json
+      
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-result
+          path: result.json
+```
+
+---
+
+## 7. 性能设计
+
+### 7.1 内存优化
 
 | 策略 | 实现 |
 |------|------|
@@ -944,7 +1054,7 @@ const agent = new CodingAgent({
 | **滚动 buffer** | 内存只保留最近 1000 条事件 |
 | **mmap** | SQLite `mmap_size=256MB`，减少 syscall |
 
-### 6.2 IO 优化
+### 7.2 IO 优化
 
 | 策略 | 实现 |
 |------|------|
@@ -953,30 +1063,33 @@ const agent = new CodingAgent({
 | **并发 drain** | stderr 单独 task，防止 pipe 满 |
 | **索引优化** | 复合索引 + 部分索引，加速查询 |
 
-### 6.3 并发控制
+### 7.3 并发限制（明确声明）
 
-| 策略 | 实现 |
-|------|------|
-| **进程池** | 限制并发 agent 数量（默认 5） |
-| **队列** | 超出限制的任务排队 |
-| **超时** | 全局超时 + 空闲超时 |
-| **资源限制** | 内存、预算、时间 |
+| 场景 | 限制 | 原因 |
+|------|------|------|
+| **写入并发** | SQLite 写锁全局 | 写写串行，WAL 只解决读写并发 |
+| **建议并发数** | ≤5 个 agent 同时执行 | 避免写竞争 |
+| **查询并发** | 无限制 | WAL 模式下读写不冲突 |
 
-### 6.4 性能指标
+**如果高并发写入是瓶颈**：
+- 方案 1: 写入队列（异步批量）
+- 方案 2: 分库（按 agent 或日期）
+- 方案 3: 换 Postgres（真正的并发写入）
+
+### 7.4 性能指标
 
 | 场景 | 目标 |
 |------|------|
 | **短任务 (<1min)** | <100ms 启动延迟，<10MB 内存 |
 | **长任务 (30min)** | 恒定 <50MB 内存，零丢失 |
-| **10 并发** | <200MB 内存，无锁竞争 |
+| **5 并发** | <100MB 内存，可接受写延迟 |
 | **100 万事件** | <1s 查询延迟（有索引） |
-| **语义搜索** | <500ms（1024 维向量） |
 
 ---
 
-## 7. 扩展机制
+## 8. 扩展机制
 
-### 7.1 插件化 Agent
+### 8.1 插件化 Agent
 
 ```python
 # 注册自定义 agent
@@ -997,7 +1110,7 @@ agent = CodingAgent(storage=storage)
 session = await agent.run(agent="custom", prompt="...")
 ```
 
-### 7.2 自定义存储后端
+### 8.2 自定义存储后端
 
 ```python
 # 实现 Postgres 存储
@@ -1017,7 +1130,7 @@ storage = PostgresStorage(dsn="postgresql://...")
 agent = CodingAgent(storage=storage)
 ```
 
-### 7.3 事件钩子
+### 8.3 事件回调
 
 ```python
 # 注册事件回调
@@ -1033,69 +1146,76 @@ async def on_error(event):
 
 ---
 
-## 8. 实现计划
+## 9. 实现计划
 
-### Phase 1: 核心（2 周）
+### Phase 1: 核心（3-4 周）
 
-| 任务 | 预计 |
-|------|------|
-| 数据模型 + SQLite schema | 2d |
-| StreamExecutor（流式执行器） | 3d |
-| ClaudeAgent + CodexAgent | 2d |
-| SQLiteStorage | 2d |
-| CLI 基础命令 | 1d |
+| 任务 | 预计 | 说明 |
+|------|------|------|
+| 数据模型 + SQLite schema | 2d | |
+| StreamExecutor（流式执行器） | 3d | 含 stderr drain、批量写入 |
+| ClaudeAgent + CodexAgent | 2d | 命令构建、输出解析 |
+| SQLiteStorage | 2d | Protocol 实现 |
+| CLI 基础命令 | 2d | run/status/list/search |
+| 单元测试 | 3d | 覆盖核心逻辑 |
+| **小计** | **14d** | 含 buffer |
 
-### Phase 2: 接口（1 周）
+### Phase 2: 接口（2 周）
 
-| 任务 | 预计 |
-|------|------|
-| HTTP Server (FastAPI) | 2d |
-| Python SDK | 1d |
-| stdio JSON 模式 | 1d |
-| 文档 | 1d |
+| 任务 | 预计 | 说明 |
+|------|------|------|
+| HTTP Server (FastAPI) | 3d | REST + SSE |
+| Python SDK | 2d | 封装 HTTP 或直接调用 |
+| stdio JSON 模式 | 1d | 类似 LSP |
+| 文档 | 2d | API 文档 + 示例 |
+| 集成测试 | 2d | |
+| **小计** | **10d** | |
 
-### Phase 3: 高级功能（1 周）
+### Phase 3: 集成（2 周）
 
-| 任务 | 预计 |
-|------|------|
-| 向量搜索（sqlite-vec） | 2d |
-| 会话恢复 | 1d |
-| 多 agent 编排 | 1d |
-| 性能测试 | 1d |
+| 任务 | 预计 | 说明 |
+|------|------|------|
+| Hermes tool 集成 | 2d | 注册为 tool |
+| OpenClaw 集成验证 | 2d | HTTP API 调用 |
+| 性能测试 | 2d | 并发、长任务 |
+| 文档完善 | 2d | 集成指南 |
+| **小计** | **8d** | |
 
-### Phase 4: 生态（持续）
+### Phase 4: 高级功能（持续）
 
-| 任务 | 预计 |
-|------|------|
-| Node.js SDK | 3d |
-| OpenClaw 集成 | 2d |
-| Hermes tool 集成 | 1d |
-| Web UI | 3d |
+| 任务 | 预计 | 说明 |
+|------|------|------|
+| 向量搜索（sqlite-vec） | 3d | 可选 |
+| Node.js SDK | 3d | |
+| Web UI | 5d | |
+| 会话恢复 | 2d | |
+
+**总计**：Phase 1-3 约 7-8 周（含 buffer）
 
 ---
 
-## 9. 风险与缓解
+## 10. 风险与缓解
 
 | 风险 | 影响 | 缓解 |
 |------|------|------|
 | **subprocess 崩溃** | 丢失输出 | WAL + 批量写入，最多丢 100ms |
 | **pipe 满卡死** | 进程挂起 | stderr 并发 drain |
 | **内存爆炸** | OOM | 流式读取 + 滚动 buffer |
-| **SQLite 锁竞争** | 性能下降 | WAL 模式 + busy_timeout |
+| **SQLite 写竞争** | 性能下降 | 限制并发数 ≤5，或换 Postgres |
 | **agent CLI 变更** | 解析失败 | 版本检测 + 适配器模式 |
-| **向量搜索慢** | 查询延迟 | 限制 top_k + 索引优化 |
+| **长任务超时** | 执行中断 | 合理设置 timeout，支持断点续传 |
 
 ---
 
-## 10. 成功标准
+## 11. 成功标准
 
 | 指标 | 目标 |
 |------|------|
 | **功能** | 支持 Claude Code + Codex，CLI/HTTP/SDK |
-| **性能** | 10 并发，30min 长任务，<50MB 内存 |
+| **性能** | 5 并发，30min 长任务，<50MB 内存 |
 | **可靠性** | 零数据丢失，崩溃恢复 |
 | **集成** | Hermes + OpenClaw 验证通过 |
-| **文档** | API 文档 + 使用示例 |
+| **文档** | API 文档 + 集成示例 |
 
 ---
 
@@ -1120,3 +1240,11 @@ async def on_error(event):
 ### C. 变更日志
 
 - 2026-06-20: v1.0.0 初始设计
+- 2026-06-20: v1.1.0 修订版
+  - 简化架构：5 层 → 3 层
+  - 明确 memorix 关系：借鉴而非复用
+  - 补充并发限制说明
+  - 增加双模式输出（透传/标准化）
+  - 补充具体集成示例
+  - 补充设计决策说明
+  - 调整实现计划时间估计
