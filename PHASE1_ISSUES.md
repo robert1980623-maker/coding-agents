@@ -38,7 +38,7 @@ Phase 1 实施 + 质量审计 + 集成测试未发现 P0 级问题。102+30 测�
 
 ### 🟡 P1 - 建议修复（影响生产可用性）
 
-#### P1-1: `kill` 命令不直接终止子进程
+#### P1-1: `kill` 命令不直接终止子进程 ✅ 已修 (v0.2.0 S1)
 
 - **来源**: 审计报告 §3.5 / v1.2.1 P2 限制
 - **影响**: CLI `kill <session-id>` 只更新数据库状态，**不会立即终止正在运行的 subprocess**
@@ -51,9 +51,10 @@ Phase 1 实施 + 质量审计 + 集成测试未发现 P0 级问题。102+30 测�
   ```
 - **当前缓解**: idle_timeout watchdog 会在 idle_timeout_seconds 后终止（默认 300s）
 - **建议方案** (Phase 2):
-  - **方案 A**: Executor 加心跳轮询，每 1-2s 检查 DB status，发现 KILLED/FAILED → `process.terminate()`
+  - **方案 A**: Executor 加心跳轮询，每 1-2s 检查 DB status，发现 KILLED/FAILED → `process.terminate()` ✅ 已实施
   - **方案 B**: 引入 Unix 信号（SIGTERM/SIGKILL）通过 IPC 通知进程
   - **方案 C**: HTTP API 用 asyncio.Event 取消任务（仅 HTTP 场景有效）
+- **实施**: `StreamExecutor._heartbeat_checker` 每 2s 轮询 DB，检测到 KILLED/FAILED 时 SIGTERM→5s→SIGKILL。实测 sleep 60 在 2.1s 内终止。
 
 #### P1-2: 多 Agent 编排未实现
 
@@ -74,21 +75,23 @@ Phase 1 实施 + 质量审计 + 集成测试未发现 P0 级问题。102+30 测�
   - 认证（环境变量 token）
   - 端点：`/sessions`, `/sessions/:id/events/stream`, `/kill`, `/recover`
 
-#### P1-4: 无 Watchdog 心跳轮询实现
+#### P1-4: 无 Watchdog 心跳轮询实现 ✅ 已修 (v0.2.0 S1)
 
 - **来源**: 设计 §4.2 idle_watchdog 设计
 - **影响**: 当前实现依赖 heartbeat 写入（写入存储），但**没有读取心跳并触发终止的机制**（kill 场景依赖 P1-1）
 - **建议方案**: 在 executor 主循环中加入心跳读取，每 N 秒检查 DB 状态
+- **实施**: `StreamExecutor._heartbeat_checker` 每 2s 检查 DB status，发现 KILLED/FAILED → 终止进程
 
 ---
 
 ### 🔵 P2 - 可选改进（性能 / 体验）
 
-#### P2-1: bandit B608 误报未消除
+#### P2-1: bandit B608 误报未消除 ✅ 已修 (v0.2.0 S1)
 
 - **来源**: 审计报告 §1
 - **影响**: bandit 报告 3 个 medium（实际是参数化 SQL 误报）
 - **建议**: 在 `sqlite.py` 的 f-string SQL 处加 `# nosec B608` 注释
+- **实施**: 已在 3 处 f-string 添加 `# nosec B608`，bandit medium 降至 0
 
 #### P2-2: 真实 Claude/Codex E2E 测试覆盖率低
 
@@ -98,10 +101,11 @@ Phase 1 实施 + 质量审计 + 集成测试未发现 P0 级问题。102+30 测�
   - 在 CI 中配置 ANTHROPIC_API_KEY 跑真实测试
   - 或用 mock server（WireMock）模拟 API
 
-#### P2-3: CLI 输出体验
+#### P2-3: CLI 输出体验 ✅ 已修 (v0.2.0 S1)
 
 - **影响**: `run` 命令默认 block 到 session 完成，没有实时流式输出
 - **建议**: 加 `--stream` 选项，实时打印 stdout/stderr
+- **实施**: `run --stream` 实时打印 `[channel seq=N] data` 到 stderr，默认模式只显示最终结果
 
 #### P2-4: 无 session 重试机制
 
@@ -119,10 +123,11 @@ Phase 1 实施 + 质量审计 + 集成测试未发现 P0 级问题。102+30 测�
 - **影响**: 无 Prometheus metrics / OpenTelemetry tracing
 - **建议**: Phase 3 添加
 
-#### P2-7: 无日志框架
+#### P2-7: 无日志框架 ✅ 已修 (v0.2.0 S1)
 
 - **影响**: 当前用 stdlib logging，配置和格式不规范
 - **建议**: 引入 structlog，统一 JSON 日志
+- **实施**: 迁移全部 src 到 structlog，JSON 输出 + 标准化字段 + CLI 全局选项 --log-level/--log-json
 
 #### P2-8: 无性能基准
 
@@ -141,9 +146,10 @@ Phase 1 实施 + 质量审计 + 集成测试未发现 P0 级问题。102+30 测�
 
 设计 §10 Phase 2 计划 13 天。
 
-#### L-3: 认证不在 Phase 1 范围
+#### L-3: 认证不在 Phase 1 范围 ✅ 基础设施已就绪 (v0.2.0 S1)
 
-HTTP 才有认证需求，CLI 默认本地使用。
+HTTP 才有认证需求，CLI 默认本地使用。Phase 2 HTTP 需要 token 验证。
+- **实施**: `auth.py` 提供 token 生成/存储/加载/验证（256-bit，常量时间比较），CLI 全局选项 `--auth-token-file` 自动管理 token
 
 #### L-4: Node.js SDK 推迟
 

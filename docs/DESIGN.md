@@ -1792,3 +1792,32 @@ agent.on("watch.match", lambda e: trigger_webhook(e))
   - **顺手修**: start_event 处理 `command=[]` 边界情况
   - **顺手修**: result event data 用 `json.dumps`
   - **注意**: 仍需出 **v1.2.2** 才能作为 Phase 1 编码基线
+- 2026-06-20: v0.2.0 Session 1 — CLI 增强 + 监控基础
+  - **T1.1 kill 命令直接终止子进程 + 心跳轮询**:
+    - `StreamExecutor.execute()` 新增 `_heartbeat_checker` task，每 2s 轮询 DB 状态
+    - 检测到 KILLED/FAILED → SIGTERM → 等 5s → SIGKILL
+    - 实测：`sleep 60` → kill 在 2.1s 内终止（远低于 10s 要求）
+    - 修 P1-1 + P1-4
+  - **T1.2 structlog 日志框架**:
+    - 引入 structlog，替换 stdlib logging
+    - JSON 输出 + 标准化字段（timestamp/level/event/session_id/seq）
+    - CLI 全局选项 `--log-level` / `--log-json`
+    - 修 P2-7
+  - **T1.3 bandit B608 误报标注**:
+    - 在 sqlite.py 的 f-string SQL 处加 `# nosec B608`
+    - bandit medium 3 → 0
+    - 修 P2-1
+  - **T1.4 CLI 流式输出**:
+    - `run --stream` 实时打印 `[channel seq=N] data` 到 stderr
+    - 默认模式只显示最终结果（保持向后兼容）
+    - 修 P2-3
+  - **T1.5 CLI 本地认证 token**:
+    - 新增 `auth.py`：token 生成 / 存储 / 加载 / 验证
+    - 全局选项 `--auth-token-file`（默认 `~/.coding-agents-token`）
+    - 首次运行自动生成 256-bit token（0600 权限）
+    - Phase 1 仅基础设施；Phase 2 HTTP server 将消费此 token
+    - 修 L-3
+  - **测试结果**: 161 passed / 2 skipped（新增 24 测试）
+  - **覆盖率**: 91%（基线 89%，+2pp）
+  - **mypy strict**: 0 errors
+  - **bandit**: 0 medium
