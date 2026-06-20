@@ -10,6 +10,9 @@ A unified, high-performance runtime for managing coding agents (Claude Code, Cod
 - **Full-Text Search**: FTS5-powered search across all agent output
 - **Crash Recovery**: Automatic detection and recovery of orphaned sessions
 - **Concurrency Control**: Semaphore-based limit on concurrent agent executions
+- **HTTP API**: 12 REST endpoints + SSE event streaming
+- **Python SDK**: Async-only client for OpenClaw / Hermes / any async Python host
+- **OpenClaw Integration**: Example scripts + integration guide
 
 ## Installation
 
@@ -82,6 +85,56 @@ coding-agents search "refactor"
 coding-agents recover
 ```
 
+### HTTP API
+
+```bash
+# Start the HTTP server (default: http://127.0.0.1:8765)
+coding-agents serve
+
+# Health check
+curl http://localhost:8765/health
+```
+
+See [`sdk/README.md`](sdk/README.md) for the full endpoint list.
+
+### Python SDK
+
+```bash
+pip install -e ./sdk
+```
+
+```python
+import asyncio
+from coding_agents_sdk import AsyncCodingAgentClient
+
+
+async def main() -> None:
+    async with AsyncCodingAgentClient(
+        base_url="http://localhost:8765",
+        token="my-secret-token",
+    ) as client:
+        # ⚠️ POST /sessions does NOT trigger execution —
+        # an external executor must consume pending sessions.
+        session = await client.create_session(agent="claude", prompt="refactor me")
+        async for event in client.stream_events(session.session_id):
+            print(event.seq, event.type, event.data)
+            if event.type == "result":
+                break
+
+
+asyncio.run(main())
+```
+
+### OpenClaw integration
+
+Example scripts + integration guide:
+
+- [`openclaw_integration/examples/create_session.py`](openclaw_integration/examples/create_session.py)
+- [`openclaw_integration/examples/query_status.py`](openclaw_integration/examples/query_status.py)
+- [`openclaw_integration/examples/stream_events.py`](openclaw_integration/examples/stream_events.py)
+- [`openclaw_integration/examples/error_handling.py`](openclaw_integration/examples/error_handling.py)
+- [`openclaw_integration/docs/INTEGRATION.md`](openclaw_integration/docs/INTEGRATION.md)
+
 ## Architecture
 
 ```
@@ -102,6 +155,9 @@ uv sync --dev
 
 # Run tests
 uv run pytest tests/ -v
+
+# Run SDK tests
+uv run pytest sdk/tests/ -v
 
 # Run tests with coverage
 uv run pytest tests/ -v --cov=coding_agents --cov-report=term-missing

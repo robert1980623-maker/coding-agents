@@ -2063,3 +2063,71 @@ uv run python -m coding_agents.http.cli_integration --port 8080 --host 127.0.0.1
 **下一步**:
 - Phase 3 后续: Node.js SDK（HTTP-only client）/ Web UI / 向量搜索（sqlite-vec）
 - Phase 3+ 高级: 并发调度优化、distributed executor、更多 agent 适配
+
+### C.8 Session 4: Python SDK + OpenClaw 集成示例 (Phase 2 接入层)
+
+**日期**: 2026-06-20
+**目标**: 完成 DESIGN.md §1.3 Phase 2「OpenClaw 集成」,交付可被 OpenClaw / 其他异步 Python host 直接消费的 SDK 和示例。
+
+#### C.8.1 决策依据 — Option A 薄封装
+
+按 plan v2 选择 **薄 HTTP 封装** 而非「SDK 包揽执行语义」,原因:
+
+- HTTP API 是单一可信源,SDK = 强类型视图,避免双实现
+- 「SDK 触发执行」会把执行策略(谁、何时、并发度)绑死在 SDK,违反职责分离
+- 测试简单(`httpx.MockTransport`),不依赖真子进程
+
+关键契约(plan v2 §约束 1):
+
+> `POST /sessions` 仅创建 `PENDING` session,**不**触发执行。SDK 的 `create_session()` 返回的 session 状态为 `pending`,需用户自管 executor 来消费 pending 队列。
+
+#### C.8.2 交付清单
+
+| 路径 | 内容 |
+| --- | --- |
+| `sdk/coding_agents_sdk/client.py` | `AsyncCodingAgentClient`(async-only),覆盖全部 12 个端点 |
+| `sdk/coding_agents_sdk/models.py` | Pydantic 模型(Session/Event/Tag/KillResult/RecoverResult/HealthStatus),独立定义不依赖服务端 |
+| `sdk/coding_agents_sdk/exceptions.py` | `APIError` / `AuthenticationError`(401)/ `NotFoundError`(404)/ `ServerError`(5xx)/ `ConnectionError_` |
+| `sdk/coding_agents_sdk/__init__.py` | 公共 API + 版本导出 |
+| `sdk/tests/test_client.py` | 24 个异步测试,使用 `httpx.MockTransport`,覆盖所有端点 + 错误路径 + SSE 流 |
+| `sdk/README.md` | 快速开始 + 完整 API 表 |
+| `sdk/pyproject.toml` | 可独立 `pip install -e ./sdk` |
+| `openclaw_integration/examples/create_session.py` | 创建 session(标注「不触发执行」) |
+| `openclaw_integration/examples/query_status.py` | 轮询直到终态(2s 间隔,默认 600s 超时) |
+| `openclaw_integration/examples/stream_events.py` | SSE 订阅 + `Last-Event-ID` 续跑 + SIGINT 优雅停 |
+| `openclaw_integration/examples/error_handling.py` | 401/404/5xx/超时 重试与降级演示 |
+| `openclaw_integration/README.md` + `docs/INTEGRATION.md` | 拓扑图 + executor 契约 + FAQ |
+
+#### C.8.3 测试结果
+
+**SDK 测试**: `pytest sdk/tests/ -v` → **24 passed in 0.07s**
+
+覆盖:
+- 会话生命周期(create/get/list、context manager、owned vs injected client)
+- 事件 REST + SSE(stream_events 多事件 + Last-Event-ID 头透传 + 404 错误传播)
+- 操作(kill/recover + recover 参数透传)
+- Tag(create 正确 body `{"tag": "..."}` / list 兼容两种返回格式 / delete 路径)
+- 健康(metrics 透传 Prometheus 文本)
+- 错误路径:401→AuthenticationError、404→NotFoundError、5xx→ServerError、其他 4xx→APIError、连接失败→ConnectionError_
+- Base URL 尾斜杠兼容、token Bearer 头注入
+
+**示例脚本冒烟**: 4 个脚本均可独立运行,无参数时打印 usage 提示并以非零码退出。
+
+#### C.8.4 已修复问题
+
+- ✅ Phase 2 「OpenClaw 集成」无 SDK(新增 `sdk/` 提供 async Python 入口)
+- ✅ Phase 2 接入层缺文档与示例(新增 `openclaw_integration/`,含 4 个脚本 + 集成指南)
+- ✅ Tag API 路径与 body 签名易错(`POST /sessions/{id}/tags`,body=`{"tag":"..."}`,在 SDK 模型和测试里固化)
+- ✅ SSE 流测试不稳定(使用 `httpx.MockTransport` 直接构造 SSE 文本,完全离线)
+
+#### C.8.5 未触碰的边界(严格执行)
+
+- ❌ `src/coding_agents/` 未修改
+- ❌ `tests/` 既有测试未修改(新增的 `sdk/tests/` 是新目录)
+- ❌ 没有修改 SDK 之外的服务端模型(SDK 模型独立,见 SHOULD #2)
+- ❌ 没有引入同步 client(只 async,见 SHOULD #1)
+
+#### C.8.6 下一步
+
+- Phase 3+: 高级接入层(Node.js SDK / Web UI / OpenAPI spec 自动生成 client)
+- 后续若新增 SDK 不承诺的语义(如 `wait_until_done()`),放到 `coding_agents_sdk.highlevel` 子模块,绝不污染薄封装核心

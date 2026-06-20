@@ -1,0 +1,87 @@
+"""SDK-specific exceptions.
+
+The SDK is a pure HTTP wrapper: it does NOT interpret or trigger execution
+semantics. Errors that bubble up are HTTP-layer errors only.
+"""
+
+from __future__ import annotations
+
+
+class CodingAgentsSDKError(Exception):
+    """Base exception for all SDK errors."""
+
+
+class APIError(CodingAgentsSDKError):
+    """An HTTP error response from the server.
+
+    Attributes:
+        status_code: HTTP status code returned by the server.
+        detail: The error detail returned in the response body (if any).
+        response_body: The raw response body (parsed as JSON when possible).
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        detail: str | None = None,
+        response_body: object | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        self.response_body = response_body
+
+        message = f"HTTP {status_code}"
+        if detail:
+            message = f"{message}: {detail}"
+        super().__init__(message)
+
+
+class AuthenticationError(APIError):
+    """Raised when the server returns 401 (missing/invalid token)."""
+
+    def __init__(
+        self,
+        detail: str | None = None,
+        response_body: object | None = None,
+    ) -> None:
+        super().__init__(401, detail=detail, response_body=response_body)
+
+
+class NotFoundError(APIError):
+    """Raised when the server returns 404 (resource does not exist)."""
+
+    def __init__(
+        self,
+        detail: str | None = None,
+        response_body: object | None = None,
+    ) -> None:
+        super().__init__(404, detail=detail, response_body=response_body)
+
+
+class ServerError(APIError):
+    """Raised when the server returns 5xx."""
+
+    def __init__(
+        self,
+        status_code: int,
+        detail: str | None = None,
+        response_body: object | None = None,
+    ) -> None:
+        super().__init__(status_code, detail=detail, response_body=response_body)
+
+
+class ConnectionError_(CodingAgentsSDKError):
+    """Raised when the SDK cannot reach the server (network/timeout).
+
+    The trailing underscore avoids clashing with the builtin ``ConnectionError``.
+    """
+
+
+__all__ = [
+    "APIError",
+    "AuthenticationError",
+    "CodingAgentsSDKError",
+    "ConnectionError_",
+    "NotFoundError",
+    "ServerError",
+]
