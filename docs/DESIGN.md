@@ -1926,3 +1926,78 @@ agent.on("watch.match", lambda e: trigger_webhook(e))
 **下一步**:
 - Phase 2: HTTP API（13 天）
 - Phase 3: 多 Agent 编排（5 天）
+
+---
+
+### C.6 Session 2: HTTP API + Metrics (T2.1-T2.3)
+
+**新增模块**:
+- `src/coding_agents/http/` - FastAPI HTTP 服务器
+  - `server.py` - FastAPI 应用工厂
+  - `auth.py` - Bearer token 认证中间件
+  - `sse.py` - SSE 事件格式化（支持 Last-Event-ID 续传）
+  - `cli_integration.py` - 服务器启动脚本
+  - `metrics_endpoint.py` - Prometheus /metrics 端点
+  - `routes/sessions.py` - Session CRUD (POST/GET /sessions)
+  - `routes/events.py` - 事件查询 (REST + SSE)
+  - `routes/actions.py` - 操作端点 (kill, recover)
+  - `routes/tags.py` - 标签管理
+- `src/coding_agents/metrics.py` - Prometheus 指标定义
+- `src/coding_agents/metrics_integration.py` - 装饰器集成 (@track_session, @track_event)
+
+**新增依赖** (pyproject.toml):
+- `fastapi>=0.115.0` - Web 框架
+- `uvicorn[standard]>=0.32.0` - ASGI 服务器
+- `sse-starlette>=2.0.0` - SSE 支持
+- `prometheus-client>=0.21.0` - Prometheus 指标
+- `httpx>=0.27.0` - 异步 HTTP 客户端（测试）
+
+**API 端点**:
+- `POST /sessions` - 创建 session
+- `GET /sessions` - 列出 sessions（支持过滤）
+- `GET /sessions/{id}` - 获取 session
+- `GET /sessions/{id}/events` - 获取事件（REST）
+- `GET /sessions/{id}/events/stream` - 流式事件（SSE）
+- `POST /sessions/{id}/kill` - 终止 session
+- `POST /sessions/{id}/tags` - 添加标签
+- `DELETE /sessions/{id}/tags/{tag}` - 删除标签
+- `GET /sessions/{id}/tags` - 列出标签
+- `POST /recover` - 恢复孤儿 sessions
+- `GET /metrics` - Prometheus 指标
+- `GET /health` - 健康检查
+
+**Prometheus 指标**:
+- `sessions_total` (Counter, labels: agent, status) - Session 生命周期
+- `session_duration_seconds` (Histogram) - Session 持续时间
+- `events_appended_total` (Counter, labels: channel) - 事件追加
+- `active_sessions` (Gauge) - 当前活跃 sessions
+- `session_registry_wait_seconds` (Histogram) - Registry 等待时间
+- `subprocess_memory_bytes` (Gauge, labels: session_id) - 子进程内存
+
+**测试结果**:
+- HTTP API: 23 个测试全部通过
+- Metrics: 18 个测试全部通过
+- 总计: 41 个新测试
+
+**类型检查**: ✅ mypy --strict 通过（13 个文件）
+
+**文件隔离**: ✅ 严格遵守，只修改/创建指定文件，未碰 executor.py, cli.py, registry.py, storage/*, agents/*, orchestrator/*
+
+**启动服务器**:
+```bash
+uv run python -m coding_agents.http.cli_integration --port 8080 --host 127.0.0.1
+```
+
+**安全特性**:
+- 默认绑定 127.0.0.1（仅本地访问）
+- Bearer token 认证（从 ~/.coding-agents-token 读取）
+- 常量时间比较防止时序攻击
+
+**SSE 特性**:
+- 支持 Last-Event-ID 头实现断点续传
+- 自动检测客户端断开连接
+- 事件格式：event type + JSON data
+
+**下一步**:
+- T2.4: 更新 PHASE1_ISSUES.md
+- Phase 2 后续: 实际执行集成（当前 HTTP API 只创建 session 记录，不启动执行）

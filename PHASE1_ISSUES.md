@@ -66,7 +66,7 @@ Phase 1 实施 + 质量审计 + 集成测试未发现 P0 级问题。102+30 测�
   - 依赖管理（任务 A 完成后再启动 B）
   - 结果聚合（merge、race、first-wins）
 
-#### P1-3: HTTP API 缺失
+#### P1-3: HTTP API 缺失 ✅ 已修 (v0.2.0 S2)
 
 - **来源**: 设计 §1.3 / Phase 2 计划
 - **影响**: 只能通过 CLI 使用，Hermes/OpenClaw 等远程 agent 无法调用
@@ -74,6 +74,7 @@ Phase 1 实施 + 质量审计 + 集成测试未发现 P0 级问题。102+30 测�
   - FastAPI + SSE
   - 认证（环境变量 token）
   - 端点：`/sessions`, `/sessions/:id/events/stream`, `/kill`, `/recover`
+- **实施**: 新增 `src/coding_agents/http/` 模块，实现完整 REST API + SSE 流式端点，Bearer token 认证（从 ~/.coding-agents-token 读取），12 个端点（sessions CRUD, events REST/SSE, kill, recover, tags, metrics, health），支持 Last-Event-ID 断点续传，默认绑定 127.0.0.1（安全设计）
 
 #### P1-4: 无 Watchdog 心跳轮询实现 ✅ 已修 (v0.2.0 S1)
 
@@ -120,10 +121,11 @@ Phase 1 实施 + 质量审计 + 集成测试未发现 P0 级问题。102+30 测�
 - **影响**: 只能恢复状态（标记 ORPHANED），不能从 last_seq 续跑
 - **说明**: v1.2.1 设计明确这是 Phase 3+ 范围
 
-#### P2-6: 无 metrics / 监控
+#### P2-6: 无 metrics / 监控 ✅ 已修 (v0.2.0 S2)
 
 - **影响**: 无 Prometheus metrics / OpenTelemetry tracing
 - **建议**: Phase 3 添加
+- **实施**: 新增 `src/coding_agents/metrics.py` + `metrics_integration.py`，实现 6 个 Prometheus 指标（sessions_total, session_duration_seconds, events_appended_total, active_sessions, session_registry_wait_seconds, subprocess_memory_bytes），提供装饰器集成（@track_session, @track_event），HTTP API 暴露 /metrics 端点
 
 #### P2-7: 无日志框架 ✅ 已修 (v0.2.0 S1)
 
