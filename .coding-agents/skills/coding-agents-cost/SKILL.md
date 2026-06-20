@@ -10,73 +10,115 @@ description: |
 
 ## When to use this skill
 
-- You're dispatching a session and need to set a sensible `--budget`
-- You're designing a batch / pipeline and need per-task cost caps
-- You want to compare agent / model costs across runs
-- A session ran out of budget and you need to understand why
+- Before dispatching a session (picking a sensible `--budget`)
+- After seeing a budget-related warning on dispatch
+- When you want to understand historical cost patterns
 
-## How budget is enforced
+## How billing works per agent
 
-`coding-agents dispatch ... --budget N` translates to the agent CLI's
-`--max-budget-usd N` flag. The agent CLI is the source of truth — it
-aborts the run when the spend hits N. coding-agents itself does not
-add a second gate.
+Not every agent honors `--budget`. Know the difference before you set one.
 
-## Recommended budgets by task class
-
-| Task class | Typical budget (USD) | Notes |
+| Agent | Billing | `--budget` behavior |
 | --- | --- | --- |
-| Trivial: typo, single-line fix | 0.30 – 0.50 | Will often under-shoot |
-| Small: function-level refactor | 1.00 – 2.00 | |
-| Medium: feature implementation | 2.00 – 5.00 | |
-| Large: refactor across many files | 5.00 – 10.00 | Watch the live output |
-| Investigation / read-only analysis | 1.00 – 3.00 | Usually cheap |
-| "Fix all the warnings" | 3.00 – 8.00 | Can spiral if alerts are noisy |
+| `claude` (Claude Code) | Subscription, with a per-run hard cap | Translated to `--max-budget-usd N`. The CLI aborts the run when spend hits N. **Always set this.** |
+| `codex` (Codex CLI) | Subscription, **no per-run cap concept** | **Ignored.** v0.2.8+ emits a warning: codex has no `--max-budget-usd` flag. The run is unbounded. |
 
-When in doubt, **start low and re-dispatch** rather than over-budgeting.
+Rule of thumb: don't assume the agent will stop at your budget. For
+codex, cost control is your responsibility via prompt scope and
+`--workdir`.
 
-## How to track cost across runs
+## Estimating cost from history
+
+The SQLite DB at `~/.coding-agents/data.db` has a `sessions` table
+with `cost_usd` and `duration_ms` per run.
 
 ```bash
-# Show cost of a specific session (last 'result' event)
-coding-agents status <session_id>
-
-# List all sessions with cost info
-coding-agents list
-
-# Search for sessions over a cost threshold
-coding-agents search "cost_usd:>5"
+# Top 10 most expensive completed sessions
+sqlite3 ~/.coding-agents/data.db \
+  "SELECT id, agent, cost_usd, duration_ms/1000 AS sec
+   FROM sessions WHERE status='completed'
+   ORDER BY cost_usd DESC LIMIT 10;"
 ```
 
-## Cost-aware patterns
+Rough benchmarks (Claude Code, real-world runs):
 
-### Cheap re-tries
+- Review / small read-only analysis: **$0.30 – $1**
+- Single-file change / focused fix: **$0.50 – $2**
+- Medium feature implementation: **$2 – $5**
+- Complex multi-file / multi-step work: **$5 – $20**
+
+When in doubt, start low and re-dispatch — overspending on a tight
+task is more common than running out on a generous one.
+
+## Controlling cost
+
+### Always scope the workdir
+
 ```bash
-# Quick: try with tight budget first
-coding-agents dispatch claude "fix bug" --workdir ~/project --budget 0.50
-# If it ran out, the events will tell you why
+coding-agents dispatch claude "fix the login bug" \
+  --workdir ~/projects/my-app --budget 2
 ```
 
-### Multi-stage pipeline
-```bash
-# Stage 1: cheap exploration
-coding-agents dispatch claude "find the bug" --workdir ~/project --budget 0.30
+`--workdir` is the single biggest cost lever. Without it the agent
+sees the whole repo and burns tokens reading unrelated files.
 
-# Stage 2: targeted fix (only if stage 1 found something)
-coding-agents dispatch claude "fix the bug" --workdir ~/project --budget 1.00
+### Pick budget by task complexity
+
+```bash
+# Simple review / single-file change
+--budget 2
+
+# Medium feature implementation
+--budget 5
+
+# Complex multi-step / cross-file work
+--budget 10   # or 15-20 for genuinely large tasks
+```
+
+**Don't default to `--budget 20`.** A review task with a $20 cap will
+happily spend $8-12 exploring corners it doesn't need to. Match the
+cap to the task.
+
+### Multi-stage for expensive work
+
+```bash
+# Stage 1: cheap exploration — find the bug
+coding-agents dispatch claude "locate the login regression" \
+  --workdir ~/projects/my-app --budget 1
+
+# Stage 2: targeted fix, only if stage 1 found something
+coding-agents dispatch claude "fix: <summary from stage 1>" \
+  --workdir ~/projects/my-app --budget 3
+```
+
+Cheaper overall than one open-ended $10 run.
+
+## Inspecting cost of a running / finished session
+
+```bash
+# Quick summary including cost
+coding-agents status <session_id> --no-events
+
+# Last N events — each includes token + cost deltas
+coding-agents tail <session_id> --limit 50
+
+# Prune stored events, keep only the final result (saves disk)
+coding-agents gc --keep-result-only
 ```
 
 ## Hard rules
 
-1. **Always set `--budget`** for any non-trivial task. Even if the
-   expected cost is small, the budget is a safety net against prompt
-   injection / agent loop bugs.
-2. **Don't over-budget** to "save time re-dispatching" — a runaway
-   session will burn the full budget before aborting.
-3. **Re-read events before re-budgeting** if a session ran out. The
-   events often show what was wasted.
+1. **Always pass `--workdir`** — it's the cheapest win.
+2. **Always set `--budget` for claude** — safety net against runaway
+   loops or prompt injection.
+3. **Don't set `--budget` for codex expecting a cap** — it's ignored;
+   you'll just see a warning.
+4. **Match budget to task size.** Review ≠ implementation ≠ refactor.
+5. **Re-read events before re-budgeting** if a session ran out — the
+   events usually show where tokens were wasted.
 
 ## Related skills
 
-- `coding-agents-dispatch` — how to set `--budget` on dispatch
-- `coding-agents-recovery` — what to do when budget runs out
+- `coding-agents-dispatch` — dispatch syntax and agent selection
+- `coding-agents-lifecycle` — status / tail / gc reference
+- `coding-agents-recovery` — what to do when a session goes wrong

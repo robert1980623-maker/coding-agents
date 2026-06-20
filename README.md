@@ -5,12 +5,13 @@ A unified, high-performance runtime for managing coding agents (Claude Code, Cod
 ## Features
 
 - **Unified Interface**: One API to call Claude Code, Codex, and more agents
-- **Streaming Output**: Real-time streaming of agent output via stdout/stderr
+- **Bounded Output**: Dispatch emits only `session_id` + JSON result — safe for the OpenClaw exec 1MB stdout buffer (v0.2.6+)
 - **Session Management**: Track execution sessions with tags, search, and recovery
 - **Full-Text Search**: FTS5-powered search across all agent output
 - **Crash Recovery**: Automatic detection and recovery of orphaned sessions
 - **Concurrency Control**: Semaphore-based limit on concurrent agent executions
-- **HTTP API**: 12 REST endpoints + SSE event streaming
+- **Garbage Collection**: `gc` cleans up old sessions to bound SQLite size (v0.2.6+)
+- **HTTP API**: REST endpoints + SSE event streaming
 - **Python SDK**: Async-only client for OpenClaw / Hermes / any async Python host
 - **OpenClaw Integration**: Example scripts + integration guide
 - **Project-local skills**: SKILL.md catalog under `.coding-agents/skills/`
@@ -19,45 +20,78 @@ A unified, high-performance runtime for managing coding agents (Claude Code, Cod
 ## Installation
 
 ```bash
-# Using uv (recommended)
-uv sync
+# Global install (recommended for dispatch / OpenClaw use)
+uv tool install /Users/rowang/projects/coding-agents
 
-# Using pip
-pip install -e .
+# Local dev install
+uv sync
 ```
 
 ## Usage
 
-### Run an agent
+### Dispatch an agent
+
+`dispatch` is the canonical command. Output is bounded — safe for
+OpenClaw exec, where stdout/stderr is capped at 1MB.
 
 ```bash
-# Run Claude Code
-coding-agents run claude "refactor this function" --workdir ~/project
+# Run Claude Code (default workdir: cwd)
+coding-agents dispatch claude "refactor this function"
+
+# Run with explicit workdir (RECOMMENDED — agent sees project AGENTS.md)
+coding-agents dispatch claude "fix the race condition" --workdir ~/projects/foo
 
 # Run Codex
-coding-agents run codex "add tests" --workdir ~/project
+coding-agents dispatch codex "add tests" --workdir ~/projects/foo
 
-# Run with custom model
-coding-agents run claude "optimize this" --model claude-sonnet-4-20250514
+# Custom model
+coding-agents dispatch claude "optimize this" --model claude-sonnet-4-20250514
 
-# Run with budget limit
-coding-agents run claude "rewrite module" --budget 5.0
+# Budget cap (claude only — codex ignores it with a warning, v0.2.9+)
+coding-agents dispatch claude "rewrite module" --budget 5.0
 ```
 
-### Manage sessions
+> v0.2.6+: dispatch never streams intermediate output. It prints
+> `session_id=<id>` early and one JSON result line at the end.
+> All stdout/stderr events are stored in SQLite — read them with
+> `status` / `tail`.
+
+### Inspect a session
 
 ```bash
-# List all sessions
-coding-agents list
-
-# Filter by agent and status
-coding-agents list --agent claude --status completed
-
-# Filter by tag
-coding-agents list --tag important
-
-# View session status
+# Session metadata + last 20 events (~4KB, OpenClaw-safe)
 coding-agents status <session-id>
+
+# More events
+coding-agents status <session-id> --limit 100
+
+# Metadata only (no events)
+coding-agents status <session-id> --no-events
+
+# Tail (default 100 events, oldest-first within the window)
+coding-agents tail <session-id>
+```
+
+### Garbage-collect old sessions
+
+```bash
+# Defaults: 30 days completed, 7 days failed, 24h running → orphaned
+coding-agents gc
+
+# Dry-run
+coding-agents gc --dry-run
+
+# Aggressive: drop stdout/stderr, keep only result events
+coding-agents gc --keep-result-only
+```
+
+### List / filter / kill
+
+```bash
+# List sessions
+coding-agents list
+coding-agents list --agent claude --status completed
+coding-agents list --tag important
 
 # Kill a running session
 coding-agents kill <session-id>
@@ -66,11 +100,8 @@ coding-agents kill <session-id>
 ### Tags
 
 ```bash
-# Add a tag
-coding-agents tag <session-id> important
-
-# Remove a tag
-coding-agents tag -r <session-id> important
+coding-agents tag <session-id> important      # add
+coding-agents tag -r <session-id> important   # remove
 ```
 
 ### Search
@@ -142,8 +173,9 @@ Example scripts + integration guide:
 This repo ships a starter set of skills under `.coding-agents/skills/`
 (agentskill.io standard). They are project-local, git-tracked, and
 discoverable by Claude Code / Codex when the agent's cwd is this repo
-root. **They are not auto-injected** — each agent discovers them
-natively (see v0.2.4 release notes).
+root (see `AGENTS.md` and `.claude/skills/` symlinks at the project root).
+**They are not auto-injected** — each agent discovers them natively
+(see v0.2.4 release notes).
 
 | Skill | When to use |
 | --- | --- |
@@ -161,7 +193,8 @@ coding-agents skill show <name>
 ```
 
 To add a new skill, create `.coding-agents/skills/<name>/SKILL.md` and
-commit it.
+add a symlink in `.claude/skills/<name>/SKILL.md` (see `.claude/skills/`
+for the existing pattern).
 
 ## Architecture
 
@@ -171,9 +204,9 @@ CLI → SessionRegistry (concurrency control) → StreamExecutor → Agent Adapt
 ```
 
 - **SessionRegistry**: Semaphore-based concurrency control with 60s queue timeout
-- **StreamExecutor**: Async subprocess management with streaming output
+- **StreamExecutor**: Async subprocess management with bounded CLI output (v0.2.6+)
 - **StorageBackend**: Protocol-based storage with SQLite implementation
-- **Agent Adapters**: Claude Code and Codex CLI wrappers
+- **Agent Adapters**: Claude Code (supports `--max-budget-usd`) and Codex CLI (no budget flag)
 
 ## Development
 
