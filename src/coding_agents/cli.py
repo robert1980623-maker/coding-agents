@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import signal
 import sys
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -151,6 +152,14 @@ async def _run_session(
     session id are written to stdout/stderr. Everything else is
     persisted to SQLite and retrieved with `status` / `tail`.
     This keeps dispatch output safely below the OpenClaw exec 1MB buffer.
+
+    Signal safety: if the wrapper receives SIGTERM / SIGINT (e.g. OpenClaw
+    1MB-buffer SIGKILL cascade, Ctrl-C, orchestrator timeout), the signal
+    handler converts it into a ``SystemExit`` so the finally block runs.
+    The finally block guarantees the session is moved out of ``running``
+    and into ``failed`` (with the signal recorded in metadata) before the
+    process actually exits — this is what prevents the "session stuck in
+    running until gc/recover turns it into orphaned" bug.
     """
     try:
         agent_type = AgentType(agent_name)
@@ -195,24 +204,114 @@ async def _run_session(
     exit_code: Optional[int] = None
     error_text: Optional[str] = None
 
+    # --- Signal handling: convert SIGTERM/SIGINT into a controlled exit ---
+    # We track which signal arrived (if any) so the finally block can
+    # record it in metadata. Raising SystemExit lets the finally block
+    # run and do the cleanup; SIGKILL bypasses everything, but there's
+    # nothing any userspace code can do about that.
+    _received_signal: dict[str, Any] = {"signal": None}
+
+    def _on_signal(signum: int) -> None:
+        _received_signal["signal"] = signum
+        # SystemExit is a BaseException that triggers finally blocks.
+        # The exit code follows the POSIX convention: 128 + signum.
+        raise SystemExit(128 + signum)
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _on_signal, sig)
+        except (NotImplementedError, OSError):
+            # Windows doesn't support add_signal_handler; OSError if not main thread.
+            pass
+
+    async def _finalize_session(sig: Optional[int]) -> None:
+        """Move session out of ``running`` if it is still stuck there.
+
+        Called from the finally block. Idempotent: if the executor loop
+        finished normally (status already COMPLETED / FAILED / KILLED)
+        this is a no-op. If a signal or unrecoverable exception killed
+        the loop mid-stream we mark it FAILED with signal/error metadata.
+        """
+        try:
+            current = await storage.get_session(session.id)
+        except Exception:  # pragma: no cover - best-effort; storage broken
+            return
+        if current is None:
+            return
+        if current.status != SessionStatus.RUNNING:
+            return
+
+        metadata: dict[str, Any] = {"error": "wrapper terminated"}
+        if sig is not None:
+            metadata["signal"] = sig
+            try:
+                metadata["signal_name"] = signal.Signals(sig).name
+            except (ValueError, AttributeError):
+                pass
+        elif exit_code is not None:
+            # Partial result: executor loop ended without a RESULT event
+            # being fully processed (shouldn't normally happen, but be safe).
+            metadata["partial_exit_code"] = exit_code
+        if error_text:
+            metadata["partial_error"] = error_text
+
+        try:
+            await storage.update_session(
+                session.id,
+                status=SessionStatus.FAILED,
+                finished_at=datetime.now(timezone.utc),
+                exit_code=exit_code if exit_code is not None else -1,
+                metadata=metadata,
+            )
+        except Exception:  # pragma: no cover - best-effort
+            # Last-ditch: even if the rich update fails, mark terminal.
+            try:
+                await storage.update_session(
+                    session.id,
+                    status=SessionStatus.FAILED,
+                    finished_at=datetime.now(timezone.utc),
+                )
+            except Exception:
+                pass
+
     try:
-        async for event in executor.execute(session.id, command, workdir):
-            # All events flow to SQLite. We only act on the terminal ones.
-            if event.type == EventType.RESULT:
-                data = json.loads(event.data)
-                exit_code = data.get("exit_code")
-            elif event.type == EventType.ERROR:
-                error_text = event.data
-    except Exception as e:
-        console.print(f"[red]Execution error: {e}[/red]")
-        await storage.update_session(
-            session.id,
-            status=SessionStatus.FAILED,
-            finished_at=datetime.now(timezone.utc),
-            metadata={"error": str(e)},
-        )
+        try:
+            async for event in executor.execute(session.id, command, workdir):
+                # All events flow to SQLite. We only act on the terminal ones.
+                if event.type == EventType.RESULT:
+                    data = json.loads(event.data)
+                    exit_code = data.get("exit_code")
+                elif event.type == EventType.ERROR:
+                    error_text = event.data
+        except SystemExit:
+            # Signal handler raised this. Don't log as generic error;
+            # the finally block will finalize the session with signal info.
+            raise
+        except Exception as e:
+            console.print(f"[red]Execution error: {e}[/red]")
+            error_text = str(e)
+            # Finalize now (status -> FAILED). The finally block will see
+            # it's no longer RUNNING and skip the duplicate update.
+            await _finalize_session(None)
     finally:
-        await registry.release(session.id)
+        # Always: release registry + finalize + close storage.
+        try:
+            await registry.release(session.id)
+        except Exception:  # pragma: no cover
+            pass
+        # If the except branch above already finalized, this is a no-op.
+        await _finalize_session(_received_signal["signal"])
+        # Restore default signal handlers (best-effort; loop may be closing).
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.remove_signal_handler(sig)
+            except (NotImplementedError, OSError, RuntimeError):
+                pass
+        try:
+            await storage.close()
+        except Exception:  # pragma: no cover
+            pass
 
     # Emit a single bounded result line so the caller knows how it ended.
     result_line = {
@@ -222,8 +321,6 @@ async def _run_session(
     }
     sys.stdout.write(json.dumps(result_line, ensure_ascii=False) + "\n")
     sys.stdout.flush()
-
-    await storage.close()
 
     if verbose:
         console.print(f"[dim]full event stream: coding-agents tail {session.id}[/dim]")
