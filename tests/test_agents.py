@@ -104,6 +104,33 @@ class TestCodexAgent:
         idx = cmd.index("-m")
         assert cmd[idx + 1] == "o4-mini"
 
+    def test_build_command_with_budget_warns_and_no_flag(self, monkeypatch):
+        """--budget is a no-op for codex (no --max-budget-usd flag).
+        CodexAgent should warn the user instead of silently dropping it."""
+        captured: list[tuple[str, str]] = []
+
+        # Patch the codex module logger's warning to capture calls.
+        from coding_agents.agents import codex as codex_mod
+        orig_warning = codex_mod.logger.warning
+
+        def _capture(event: str, *args, **kwargs):
+            captured.append((event, str(args)))
+            orig_warning(event, *args, **kwargs)
+
+        monkeypatch.setattr(codex_mod.logger, "warning", _capture)
+
+        agent = CodexAgent()
+        config = ExecutionConfig(max_budget_usd=5.0)
+        cmd = agent.build_command("test", config)
+
+        # No budget flag should appear in the command
+        assert "--max-budget-usd" not in cmd
+        assert "5" not in cmd  # numeric budget value also not in cmd
+        # Warning should have been logged
+        assert any("codex" in e.lower() and "budget" in e.lower()
+                   for e, _ in captured), \
+            f"expected budget warning, got: {captured}"
+
     def test_parse_output_turn_completed(self):
         agent = CodexAgent()
         line = json.dumps({

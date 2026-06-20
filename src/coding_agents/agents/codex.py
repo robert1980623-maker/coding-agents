@@ -27,6 +27,17 @@ class CodexAgent(BaseAgent):
         if config.model:
             cmd.extend(["-m", config.model])
 
+        # Codex CLI does not support a per-session cost/budget cap.
+        # It bills via OpenAI ChatGPT subscription (not per-token), so
+        # there is no `--max-budget-usd` flag (v0.2.7). Warn the user
+        # if they passed --budget so they know it is a no-op.
+        if config.max_budget_usd is not None:
+            logger.warning(
+                "codex-agent: --budget is a no-op for codex; "
+                "codex CLI has no --max-budget-usd flag. "
+                "codex uses ChatGPT subscription billing, not per-token cost.",
+            )
+
         # Note: We intentionally do NOT inject coding-agents skills into
         # the Codex prompt. Codex has its own skill discovery (AGENTS.md
         # and project conventions) and we should not pollute its context.
