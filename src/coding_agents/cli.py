@@ -14,6 +14,7 @@ from rich.console import Console
 from rich.table import Table
 
 from coding_agents.agents.factory import get_agent
+from coding_agents.auth import ensure_token, get_token_path
 from coding_agents.executor import StreamExecutor
 from coding_agents.logging_config import setup_logging
 from coding_agents.models import (
@@ -43,9 +44,24 @@ DEFAULT_DB = "~/.coding-agents/data.db"
 def _global_options(
     log_level: str = typer.Option("INFO", "--log-level", help="Log level: DEBUG, INFO, WARNING, ERROR"),
     log_json: bool = typer.Option(True, "--log-json/--no-log-json", help="Output logs as JSON lines"),
+    auth_token_file: Optional[str] = typer.Option(
+        None,
+        "--auth-token-file",
+        help="Path to auth token file (default: ~/.coding-agents-token). "
+        "Auto-generated on first run if missing.",
+    ),
 ) -> None:
     """Global options for all commands."""
     setup_logging(level=log_level, json_output=log_json)
+    # Ensure auth token is available (generate if missing)
+    # In Phase 1 we just materialize the token; Phase 2 HTTP server will validate it.
+    token_path = get_token_path(auth_token_file)
+    if not token_path.exists():
+        token = ensure_token(auth_token_file)
+        console.print(
+            f"[dim]Generated auth token at {token_path}[/dim]"
+        )
+        _ = token  # phase 1: not consumed yet
 
 
 def _get_storage() -> SQLiteStorage:
