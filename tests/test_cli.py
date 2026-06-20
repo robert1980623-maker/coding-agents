@@ -177,3 +177,65 @@ class TestRecoverCommand:
         result = runner.invoke(app, ["recover"])
         assert result.exit_code == 0
         assert "marked" in result.stdout.lower()
+
+
+class TestStreamOption:
+    """Test the --stream option for the run command."""
+
+    def test_run_with_stream(self, mock_db: Path, tmp_path: Path):
+        """Verify --stream emits annotated events to stderr with [channel seq=N] format."""
+        import sys
+        from unittest.mock import patch
+
+        # Use a simple Python command that writes to stdout
+        fake_command = [
+            sys.executable,
+            "-c",
+            "print('line1'); print('line2')",
+        ]
+
+        # Patch the agent factory to return an adapter that builds our fake command
+        class FakeAdapter:
+            def build_command(self, prompt, config):
+                return fake_command
+
+        with patch("coding_agents.cli.get_agent", return_value=FakeAdapter()):
+            result = runner.invoke(
+                app,
+                ["run", "claude", "test prompt", "--stream"],
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0
+        # Stream mode writes annotations to stderr (captured in result.output by CliRunner)
+        output = result.output
+        # Verify annotations contain [stdout seq=N] format
+        assert "[stdout seq=" in output
+        assert "line1" in output
+        assert "line2" in output
+        # Should also have a session.start annotation
+        assert "[system seq=" in output
+
+    def test_run_without_stream_shows_final(self, mock_db: Path, tmp_path: Path):
+        """Verify default (no --stream) shows only final output."""
+        import sys
+        from unittest.mock import patch
+
+        fake_command = [sys.executable, "-c", "print('final output')"]
+
+        class FakeAdapter:
+            def build_command(self, prompt, config):
+                return fake_command
+
+        with patch("coding_agents.cli.get_agent", return_value=FakeAdapter()):
+            result = runner.invoke(
+                app,
+                ["run", "claude", "test prompt"],
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0
+        # Non-stream mode should contain the final output
+        assert "final output" in result.output
+        # But NOT have [stdout seq=...] annotations
+        assert "[stdout seq=" not in result.output

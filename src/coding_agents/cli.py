@@ -65,10 +65,11 @@ def run(
     model: Optional[str] = typer.Option(None, help="Model override"),
     budget: Optional[float] = typer.Option(None, help="Max budget in USD"),
     output_mode: str = typer.Option("standard", help="Output mode: standard or passthrough"),
+    stream: bool = typer.Option(False, "--stream", help="Stream events in real-time with annotations"),
     verbose: bool = typer.Option(False, help="Verbose output"),
 ) -> None:
     """Run a coding agent session."""
-    _run_async(_run_session(agent, prompt, workdir, model, budget, output_mode, verbose))
+    _run_async(_run_session(agent, prompt, workdir, model, budget, output_mode, stream, verbose))
 
 
 async def _run_session(
@@ -78,6 +79,7 @@ async def _run_session(
     model: Optional[str],
     budget: Optional[float],
     output_mode: str,
+    stream: bool,
     verbose: bool,
 ) -> None:
     try:
@@ -116,18 +118,56 @@ async def _run_session(
 
     executor = StreamExecutor(store=storage, config=config)
 
+    last_stdout_data = ""
+    last_stderr_data = ""
+    exit_code: Optional[int] = None
+
     try:
         async for event in executor.execute(session.id, command, workdir):
             if event.type == EventType.STDOUT:
-                sys.stdout.write(event.data)
-                sys.stdout.flush()
+                if stream:
+                    sys.stderr.write(f"[stdout seq={event.seq}] {event.data}")
+                    if not event.data.endswith("\n"):
+                        sys.stderr.write("\n")
+                    sys.stderr.flush()
+                else:
+                    last_stdout_data = event.data
             elif event.type == EventType.STDERR:
-                sys.stderr.write(event.data)
-                sys.stderr.flush()
+                if stream:
+                    sys.stderr.write(f"[stderr seq={event.seq}] {event.data}")
+                    if not event.data.endswith("\n"):
+                        sys.stderr.write("\n")
+                    sys.stderr.flush()
+                else:
+                    last_stderr_data = event.data
             elif event.type == EventType.RESULT:
                 data = json.loads(event.data)
-                if verbose:
-                    console.print(f"\n[dim]exit_code={data.get('exit_code')}[/dim]")
+                exit_code = data.get("exit_code")
+                if not stream:
+                    # In non-stream mode, print the final output
+                    if last_stdout_data:
+                        sys.stdout.write(last_stdout_data)
+                        if not last_stdout_data.endswith("\n"):
+                            sys.stdout.write("\n")
+                        sys.stdout.flush()
+                    if last_stderr_data:
+                        sys.stderr.write(last_stderr_data)
+                        if not last_stderr_data.endswith("\n"):
+                            sys.stderr.write("\n")
+                        sys.stderr.flush()
+                if verbose or stream:
+                    console.print(f"[dim]exit_code={exit_code}[/dim]")
+            elif event.type == EventType.ERROR and stream:
+                sys.stderr.write(f"[error seq={event.seq}] {event.data}\n")
+                sys.stderr.flush()
+            elif event.type == EventType.SESSION_START and stream:
+                start_data = json.loads(event.data)
+                sys.stderr.write(
+                    f"[system seq={event.seq}] session started: "
+                    f"{start_data.get('session_id', '')[:8]} "
+                    f"agent={start_data.get('agent', '?')}\n"
+                )
+                sys.stderr.flush()
     except Exception as e:
         console.print(f"[red]Execution error: {e}[/red]")
         await storage.update_session(
