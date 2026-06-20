@@ -33,18 +33,11 @@ class ClaudeAgent(BaseAgent):
         if config.model:
             cmd.extend(["--model", config.model])
 
-        # Inject available skills into system prompt (agentskill.io standard)
-        if getattr(config, "use_skills", True):
-            try:
-                from coding_agents.skills.loader import load_all_skills
-                from coding_agents.skills.injector import build_skills_preamble
-                skills = load_all_skills()
-                preamble = build_skills_preamble(skills)
-                if preamble:
-                    cmd.extend(["--append-system-prompt", preamble])
-            except Exception:
-                # Skill injection is best-effort; never block execution
-                pass
+        # Note: We intentionally do NOT inject coding-agents skills via
+        # --append-system-prompt. Claude Code has its own skill system
+        # (~/.claude/skills/, /skill command) and will pick the best one
+        # for the task on its own. Forcing our skill list would compete
+        # with Claude's native discovery and could mislead the agent.
 
         cmd.append(prompt)
         return cmd
