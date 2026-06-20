@@ -27,6 +27,7 @@
 | **渐进增强** | 基础功能零配置，高级功能按需启用 |
 | **简单优先** | v1.0 架构从简，避免过度设计 |
 | **安全默认** | 默认绑定 localhost，认证必须 |
+| **正确性优先** | v1.2.1 后增加：状态机终态不可覆盖、错误路径必须清理资源、JSON 必须安全转义 |
 
 ### 1.3 使用场景
 
@@ -487,6 +488,8 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 ### 4.1 SessionRegistry — 并发控制（v1.2.1 新增）
 
+> **v1.2.1 P0-NEW 修复**：修 semaphore 泄漏（P0-NEW-1/2）。`acquire()` 前置检查防止重复获取同 session_id；`kill_session()` 取消任务后释放 semaphore slot，避免 5 次 kill 后死锁。
+
 ```python
 # registry.py
 
@@ -500,22 +503,36 @@ class SessionRegistry:
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._active_sessions: Dict[str, asyncio.Task] = {}
         self._lock = asyncio.Lock()
+        # v1.2.1 P0-NEW-2 修复：跟踪已持有 slot 的 session
+        self._acquired: set[str] = set()
     
     async def acquire(self, session_id: str) -> bool:
         """获取执行许可，返回是否成功"""
+        async with self._lock:
+            # v1.2.1 P0-NEW-2 修复：防止重复 acquire 同一 session_id 泄漏 slot
+            if session_id in self._acquired:
+                raise RuntimeError(f"session {session_id} already acquired")
+        
         try:
             await asyncio.wait_for(self._semaphore.acquire(), timeout=60)
-            async with self._lock:
-                self._active_sessions[session_id] = asyncio.current_task()
-            return True
         except asyncio.TimeoutError:
             return False
+        
+        # semaphore 获取成功后才记录
+        async with self._lock:
+            self._active_sessions[session_id] = asyncio.current_task()
+            self._acquired.add(session_id)
+        return True
     
     async def release(self, session_id: str):
         """释放执行许可"""
         async with self._lock:
             self._active_sessions.pop(session_id, None)
-        self._semaphore.release()
+            had_slot = session_id in self._acquired
+            self._acquired.discard(session_id)
+        # v1.2.1 P0-NEW-1 修复：只在持有 slot 时释放
+        if had_slot:
+            self._semaphore.release()
     
     async def list_active(self) -> list[str]:
         """列出活跃 session"""
@@ -526,10 +543,20 @@ class SessionRegistry:
         """终止活跃 session"""
         async with self._lock:
             task = self._active_sessions.get(session_id)
-            if task and not task.done():
-                task.cancel()
-                return True
-            return False
+            had_slot = session_id in self._acquired
+        
+        if task and not task.done():
+            task.cancel()
+        
+        # v1.2.1 P0-NEW-1 修复：cancel 后必须释放 semaphore slot
+        # 否则 5 次 kill 后系统死锁（所有 slot 被占但 session 已结束）
+        if had_slot:
+            async with self._lock:
+                self._active_sessions.pop(session_id, None)
+                self._acquired.discard(session_id)
+            self._semaphore.release()
+        
+        return task is not None and not task.done()
 ```
 
 ### 4.2 Executor — 流式进程执行器
@@ -548,8 +575,9 @@ class SessionRegistry:
 # executor.py
 
 import asyncio
+import json  # v1.2.1 P0-NEW-4 修复：error event 用 json.dumps 避免非法 JSON
 import time
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Callable, Optional
 
 class SeqCounter:
     """per-session 单调递增序号计数器"""
@@ -590,7 +618,8 @@ class StreamExecutor:
             channel="system",
             seq=seq,
             type=EventType.SESSION_START,
-            data=f'{{"session_id":"{session_id}","agent":"{command[0]}"}}',
+            # v1.2.1 P0-NEW-4 修复：用 json.dumps 避免 UUID/路径含特殊字符时非法 JSON
+            data=json.dumps({"session_id": session_id, "agent": command[0] if command else "unknown"}),
         )
         self._buffer.append(start_event)
         await self._flush()
@@ -614,11 +643,25 @@ class StreamExecutor:
                 channel="system",
                 seq=seq,
                 type=EventType.ERROR,
-                data=f'{{"code":"SUBPROCESS_FAILED","message":"{str(e)}"}}',
+                # v1.2.1 P0-NEW-4 修复：用 json.dumps 转义消息（文件路径含引号会破坏 JSON）
+                data=json.dumps({
+                    "code": "SUBPROCESS_FAILED",
+                    "message": str(e),
+                    "command": command,
+                }),
             )
             self._buffer.append(error_event)
             await self._flush()
             yield error_event
+            
+            # v1.2.1 P0-NEW-5 修复：启动失败必须更新 session 状态为 FAILED，
+            # 否则 session 永远卡在 PENDING 成为幽灵记录
+            await self.store.update_session(
+                session_id,
+                status=SessionStatus.FAILED,
+                finished_at=datetime.now(),
+                metadata={"error": str(e), "error_type": type(e).__name__},
+            )
             return
         
         # 更新 session
@@ -630,10 +673,23 @@ class StreamExecutor:
             last_heartbeat_at=datetime.now(),
         )
         
+        # v1.2.1 修复：使用 asyncio.Queue 集中产出事件，按 seq 顺序 yield。
+        # stdout reader 和 stderr drain 都推同一个 Queue，
+        # 主循环从 Queue 取，seq 全局单调递增保证顺序。
+        # 关闭协议：用计数器跟踪 reader 数，每个 reader 结束时减 1，为 0 时才推 EOF。
+        event_queue: asyncio.Queue[Optional[Event]] = asyncio.Queue()
+        readers_remaining = 2  # stdout reader + stderr drain
+        
+        async def mark_reader_done():
+            nonlocal readers_remaining
+            readers_remaining -= 1
+            if readers_remaining == 0:
+                await event_queue.put(None)  # 最后一个 reader 结束才推 EOF
+        
         # stderr 并发 drain → 防止 pipe 满
-        # v1.2.1 修复：stderr 事件也放入 buffer，但不 yield（避免乱序）
+        # v1.2.1 修复：stderr 事件也 yield 给消费者（推到同一 Queue）。
         stderr_task = asyncio.create_task(
-            self._drain_stderr(session_id, self._process.stderr)
+            self._drain_stderr(session_id, self._process.stderr, event_queue, mark_reader_done)
         )
         
         # v1.2.1 新增：idle timeout watchdog
@@ -643,32 +699,40 @@ class StreamExecutor:
         
         # stdout 流式读取
         try:
-            async for line in self._process.stdout:
-                # v1.2.1 修复：heartbeat 节流（最多每 1 秒写一次）
-                now = time.time()
-                if now - self._last_heartbeat_write >= 1.0:
-                    await self.store.update_session(
-                        session_id, last_heartbeat_at=datetime.now()
-                    )
-                    self._last_heartbeat_write = now
-                
-                seq = await self._seq.next()
-                event = Event(
-                    session_id=session_id,
-                    channel="stdout",
-                    seq=seq,
-                    type=EventType.STDOUT,
-                    data=self._extract_text(line.decode(), self.config.output_mode),
-                    raw_json=line.decode() if self.config.output_mode == "passthrough" else None,
-                )
-                
-                # 先写入 storage（durable）
-                self._buffer.append(event)
-                await self._flush_if_needed()
-                
-                # 再 yield（best-effort 实时）
+            async def stdout_reader():
+                """stdout reader：写到 buffer + 推 event_queue"""
+                try:
+                    async for line in self._process.stdout:
+                        now = time.time()
+                        if now - self._last_heartbeat_write >= 1.0:
+                            await self.store.update_session(
+                                session_id, last_heartbeat_at=datetime.now()
+                            )
+                            self._last_heartbeat_write = now
+                        
+                        seq = await self._seq.next()
+                        event = Event(
+                            session_id=session_id,
+                            channel="stdout",
+                            seq=seq,
+                            type=EventType.STDOUT,
+                            data=self._extract_text(line.decode(), self.config.output_mode),
+                            raw_json=line.decode() if self.config.output_mode == "passthrough" else None,
+                        )
+                        self._buffer.append(event)
+                        await self._flush_if_needed()
+                        await event_queue.put(event)
+                finally:
+                    await mark_reader_done()
+            
+            stdout_task = asyncio.create_task(stdout_reader())
+            
+            while True:
+                # v1.2.1 修复：从 queue 取事件，按到达顺序 yield
+                event = await event_queue.get()
+                if event is None:
+                    break  # 所有 reader EOF
                 yield event
-                
                 # 检查 watch patterns
                 await self._check_watch_patterns(session_id, event)
         
@@ -683,19 +747,42 @@ class StreamExecutor:
             except asyncio.CancelledError:
                 pass
             
+            # 等待 stdout reader 完成（可能已经被外层打断）
+            try:
+                await stdout_task
+            except asyncio.CancelledError:
+                pass
+            
             # 等待 stderr 完成
             await stderr_task
             
             # 等待进程退出
             exit_code = await self._process.wait()
             
-            # 更新 session
-            await self.store.update_session(
-                session_id,
-                status=SessionStatus.COMPLETED if exit_code == 0 else SessionStatus.FAILED,
-                exit_code=exit_code,
-                finished_at=datetime.now(),
-            )
+            # v1.2.1 P0-NEW-3 修复：检查 status 是否已被 watchdog 设为终态（如 TIMEOUT），
+            # 避免覆盖为 FAILED/COMPLETED。
+            current_session = await self.store.get_session(session_id)
+            terminal_states = {
+                SessionStatus.COMPLETED,
+                SessionStatus.FAILED,
+                SessionStatus.KILLED,
+                SessionStatus.TIMEOUT,
+                SessionStatus.ORPHANED,
+            }
+            if current_session and current_session.status in terminal_states:
+                # 已被 watchdog/kill 设过终态，不再覆盖
+                logger.info(
+                    f"session {session_id} already in terminal state {current_session.status.value}, "
+                    f"skipping status update"
+                )
+            else:
+                # 更新 session
+                await self.store.update_session(
+                    session_id,
+                    status=SessionStatus.COMPLETED if exit_code == 0 else SessionStatus.FAILED,
+                    exit_code=exit_code,
+                    finished_at=datetime.now(),
+                )
             
             seq = await self._seq.next()
             yield Event(
@@ -703,27 +790,42 @@ class StreamExecutor:
                 channel="system",
                 seq=seq,
                 type=EventType.RESULT,
-                data=f"{{\"exit_code\":{exit_code}}}",
+                data=json.dumps({"exit_code": exit_code}),  # v1.2.1 P0-NEW-4 顺手修
             )
     
     async def _drain_stderr(
         self,
         session_id: str,
         stderr: asyncio.StreamReader,
+        queue: asyncio.Queue,
+        on_done: Callable,
     ):
-        """并发读取 stderr，防止 pipe 满"""
-        async for line in stderr:
-            seq = await self._seq.next()
-            event = Event(
-                session_id=session_id,
-                channel="stderr",
-                seq=seq,
-                type=EventType.STDERR,
-                data=line.decode(),
-            )
-            # v1.2.1 修复：stderr 也写入 buffer（可通过 stream_events 读取）
-            self._buffer.append(event)
-            await self._flush_if_needed()
+        """并发读取 stderr，防止 pipe 满。
+        
+        v1.2.1 修复：stderr 也写入 buffer 并通过 Queue yield 给消费者。
+        顺序由全局单调递增 seq 保证（主循环从 Queue 取）。本 task 职责：
+        1. 反压式读取 stderr pipe（防止 pipe 满）
+        2. 写 buffer（durable storage）
+        3. 推到 Queue 供主循环 yield
+        4. 完成时调 on_done 通知主循环计数
+        """
+        try:
+            async for line in stderr:
+                seq = await self._seq.next()
+                event = Event(
+                    session_id=session_id,
+                    channel="stderr",
+                    seq=seq,
+                    type=EventType.STDERR,
+                    data=line.decode(),
+                )
+                # 先写 storage（durable）
+                self._buffer.append(event)
+                await self._flush_if_needed()
+                # 推到 Queue 供主循环 yield（给 SSE/SDK）
+                await queue.put(event)
+        finally:
+            await on_done()
     
     async def _idle_watchdog(self, session_id: str):
         """v1.2.1 新增：idle timeout watchdog"""
@@ -774,9 +876,12 @@ class StreamExecutor:
     async def _flush(self):
         """写入 storage"""
         if self._buffer:
-            await self.store.append_events(self._buffer)
-            self._buffer.clear()
+            # v1.2.1 P1-NEW-1 修复：原子交换 buffer，避免 stdout/stderr 并发 append 时丢事件。
+            # 原代码：await append_events(buffer); buffer.clear() 之间不是原子的，
+            # stderr drain 在 append_events 等待期间插入的 event 会被 clear 丢失。
+            events, self._buffer = self._buffer, []
             self._last_flush = time.time()
+            await self.store.append_events(events)
     
     async def _check_watch_patterns(self, session_id: str, event: Event):
         """v1.2.1 恢复：检查监控模式"""
@@ -1676,3 +1781,14 @@ agent.on("watch.match", lambda e: trigger_webhook(e))
   - **认证明确**: 环境变量 `CODING_AGENT_AUTH_TOKEN`，明文比对
   - **多 Agent 编排**: 标注为 Phase 3+
   - **时间**: Phase 1 增加到 19 天
+- 2026-06-20: v1.2.1 P0-NEW 修复版（Claude 评审后修订）
+  - **P0-NEW-1**: SessionRegistry.kill_session 释放 semaphore slot（修 5 次 kill 后死锁）
+  - **P0-NEW-2**: SessionRegistry.acquire 前置检查同 session_id 重复 acquire
+  - **P0-NEW-3**: finally 块检查 status 已被 watchdog 设为终态，避免覆盖 TIMEOUT
+  - **P0-NEW-4**: error/start/result event 改用 `json.dumps` 转义（修含特殊字符时非法 JSON）
+  - **P0-NEW-5**: subprocess 启动失败 yield error 后必须 `update_session(status=FAILED)`
+  - **P1-NEW-1**: `_flush` 原子交换 buffer（修并发丢事件）
+  - **顺手修**: stderr yield 语义统一（Queue 桥接 + 主循环从 Queue 取）
+  - **顺手修**: start_event 处理 `command=[]` 边界情况
+  - **顺手修**: result event data 用 `json.dumps`
+  - **注意**: 仍需出 **v1.2.2** 才能作为 Phase 1 编码基线
