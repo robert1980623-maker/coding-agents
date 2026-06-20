@@ -18,7 +18,17 @@ description: |
 
 ## How to dispatch
 
-The canonical command is `coding-agents dispatch`:
+The canonical command is `coding-agents dispatch`. It is installed
+globally as `/Users/rowang/.local/bin/coding-agents` (via `uv tool
+install`); `which coding-agents` should return that path.
+
+If `coding-agents` is not on your PATH, install it once:
+
+```bash
+cd /Users/rowang/projects/coding-agents && uv tool install .
+```
+
+Canonical commands:
 
 ```bash
 # 1. Simplest: current directory, streamed
