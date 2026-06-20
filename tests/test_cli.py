@@ -93,6 +93,145 @@ class TestListCommand:
         assert result.exit_code == 0
         assert "claude task" in result.stdout.lower()
 
+    def test_list_shows_full_uuid_by_default(self, mock_db: Path):
+        """v0.2.13: ``list`` must show the full 36-char UUID by default so
+        users can copy-paste it directly into ``status`` / ``tail`` / ``kill``.
+        Regression: pre-v0.2.13 truncated to ``id[:8]`` which made the rest of
+        the UUID unfindable without first running ``status`` to discover it.
+
+        The UUID may be folded across multiple lines in narrow terminals
+        (rich table is terminal-width-aware), so we assert on the visible
+        fragments rather than a single substring match.
+        """
+        import asyncio
+
+        async def _setup():
+            store = SQLiteStorage(mock_db)
+            await store.initialize()
+            s = Session(agent=AgentType.CLAUDE, prompt="uuid check")
+            await store.create_session(s)
+            await store.close()
+            return s.id
+
+        full_id = asyncio.run(_setup())
+        # Sanity: Session.id is a UUID4 (36 chars including dashes)
+        assert len(full_id) == 36, f"expected 36-char UUID, got {len(full_id)}"
+
+        result = runner.invoke(app, ["list"])
+        assert result.exit_code == 0
+        # The first 8 chars must appear — this is the same as the legacy
+        # truncation, so a regression that re-introduced id[:8] would
+        # still pass this assertion. To distinguish, we also check the
+        # suffix (last 8 chars) appears somewhere in the output. A pure
+        # id[:8] regression would never emit the suffix.
+        assert full_id[:8] in result.stdout, (
+            f"first 8 chars of UUID missing:\n{result.stdout}"
+        )
+        assert full_id[-8:] in result.stdout, (
+            f"last 8 chars of UUID missing — looks like id[:8] regression:\n{result.stdout}"
+        )
+        # And the full id must be present once we strip rich's table
+        # whitespace (which folds long cells across lines).
+        import re as _re
+        stripped = _re.sub(r"\s+", "", result.stdout)
+        assert full_id in stripped, (
+            f"full UUID {full_id!r} not in list output (after stripping whitespace):\n{result.stdout}"
+        )
+
+    def test_list_short_id_flag_truncates(self, mock_db: Path):
+        """v0.2.13: ``--short-id`` opts back into the compact 8-char view
+        for users who prefer it (the table fits more rows on screen).
+        """
+        import asyncio
+
+        async def _setup():
+            store = SQLiteStorage(mock_db)
+            await store.initialize()
+            s = Session(agent=AgentType.CLAUDE, prompt="short id check")
+            await store.create_session(s)
+            await store.close()
+            return s.id
+
+        full_id = asyncio.run(_setup())
+
+        result = runner.invoke(app, ["list", "--short-id"])
+        assert result.exit_code == 0
+        # The short form (first 8 chars) appears, but the full UUID does NOT
+        # — otherwise the flag is a no-op.
+        assert full_id[:8] in result.stdout
+        assert full_id not in result.stdout, (
+            f"full UUID unexpectedly present in --short-id output:\n{result.stdout}"
+        )
+
+    def test_list_short_id_default_off(self, mock_db: Path):
+        """v0.2.13: ``--short-id`` must default to OFF. Verifies the
+        boolean is wired as a flag, not a positional argument.
+        """
+        import asyncio
+        import re as _re
+
+        async def _setup():
+            store = SQLiteStorage(mock_db)
+            await store.initialize()
+            s = Session(agent=AgentType.CLAUDE, prompt="default off check")
+            await store.create_session(s)
+            await store.close()
+            return s.id
+
+        full_id = asyncio.run(_setup())
+
+        # Just `list` (no flag) must show the full UUID.
+        result_default = runner.invoke(app, ["list"])
+        stripped = _re.sub(r"\s+", "", result_default.stdout)
+        assert full_id in stripped, (
+            f"default `list` does not show full UUID:\n{result_default.stdout}"
+        )
+
+
+class TestSearchCommand:
+    def test_search_no_results(self, mock_db: Path):
+        result = runner.invoke(app, ["search", "nonexistent"])
+        assert result.exit_code == 0
+        assert "no matching" in result.stdout.lower()
+
+    def test_search_shows_full_uuid(self, mock_db: Path):
+        """v0.2.13: ``search`` output must show the full 36-char UUID so
+        the user can pipe it into ``tail`` / ``kill`` directly. Previously
+        truncated to ``session_id[:8]`` which made tail/kill unusable.
+        """
+        import asyncio
+
+        async def _setup():
+            store = SQLiteStorage(mock_db)
+            await store.initialize()
+            s = Session(agent=AgentType.CLAUDE, prompt="marker-prompt")
+            await store.create_session(s)
+            from coding_agents.models import Event, EventType
+            await store.append_events([Event(
+                session_id=s.id,
+                channel="stdout",
+                seq=1,
+                type=EventType.STDOUT,
+                data="marker-output line",
+            )])
+            await store.close()
+            return s.id
+
+        full_id = asyncio.run(_setup())
+        result = runner.invoke(app, ["search", "marker-output"])
+        assert result.exit_code == 0
+        # The last 8 chars of the UUID must appear — this is a strong
+        # signal that the pre-v0.2.13 `session_id[:8]` truncation has
+        # been removed. We don't try substring-matching the full UUID
+        # because rich's formatting can split the output across lines.
+        assert full_id[-8:] in result.stdout, (
+            f"last 8 chars of UUID missing in search output — looks like "
+            f"session_id[:8] regression:\n{result.stdout}"
+        )
+        # And the first 8 must also be present (it was, but if not, that's
+        # also a regression).
+        assert full_id[:8] in result.stdout
+
 
 class TestTagCommand:
     def test_add_tag(self, mock_db: Path):
@@ -163,13 +302,6 @@ class TestKillCommand:
         result = runner.invoke(app, ["kill", sid])
         assert result.exit_code == 0
         assert "already" in result.stdout.lower()
-
-
-class TestSearchCommand:
-    def test_search_no_results(self, mock_db: Path):
-        result = runner.invoke(app, ["search", "nonexistent"])
-        assert result.exit_code == 0
-        assert "no matching" in result.stdout.lower()
 
 
 class TestRecoverCommand:

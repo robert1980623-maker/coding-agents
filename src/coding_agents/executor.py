@@ -112,7 +112,7 @@ class StreamExecutor:
                 stderr=asyncio.subprocess.PIPE,
                 limit=self.config.line_limit,
                 env=merged_env,
-                start_new_session=True,  # v0.2.12: detach subprocess to its own process group
+                start_new_session=True,  # v0.2.13: detach subprocess to its own process group
             )
         except Exception as e:
             # Emit error event
@@ -234,28 +234,39 @@ class StreamExecutor:
             except asyncio.CancelledError:
                 pass
 
-            # Terminate the subprocess first to unblock stdout/stderr readers
-            if self._process is not None and self._process.returncode is None:
-                self._process.terminate()
-                try:
-                    await asyncio.wait_for(self._process.wait(), timeout=2.0)
-                except asyncio.TimeoutError:
-                    if self._process.returncode is None:
-                        self._process.kill()
-
+            # v0.2.13: With start_new_session=True, the subprocess is in
+            # its own process group and detached from the wrapper. If the
+            # executor is being cancelled (e.g. wrapper got SIGTERM), we
+            # must NOT terminate the subprocess - it should keep running
+            # so the user can `tail` its output. We cancel the readers
+            # explicitly (they'd otherwise block forever on the still-open
+            # pipes) and use a short timeout for the wait.
+            stdout_task.cancel()
             try:
                 await stdout_task
             except asyncio.CancelledError:
                 pass
 
+            stderr_task.cancel()
             try:
                 await stderr_task
             except asyncio.CancelledError:
                 pass
 
-            # Wait for process to finish (should already be done)
+            # Wait for the subprocess with a short timeout. In normal
+            # completion the subprocess has already exited (the readers
+            # saw EOF before we got here, so wait() returns immediately).
+            # In cancellation the subprocess is detached and may still
+            # be running; we don't block on it.
             if self._process is not None:
-                exit_code = await self._process.wait()
+                try:
+                    exit_code = await asyncio.wait_for(
+                        self._process.wait(), timeout=0.5
+                    )
+                except asyncio.TimeoutError:
+                    # Subprocess is detached and still running; the OS
+                    # will reap it when it exits. Don't block the wrapper.
+                    exit_code = -1
             else:
                 exit_code = -1
 
@@ -268,11 +279,26 @@ class StreamExecutor:
                     status=current_session.status.value,
                 )
             else:
+                # v0.2.13: When the wrapper detached (exited while the
+                # subprocess is still running in its own process group),
+                # exit_code will be -1 from the 0.5s wait timeout. Record
+                # the subprocess PID in metadata so users can `tail` the
+                # agent's output or send SIGTERM to the process group.
+                metadata_update: dict = {}
+                if exit_code == -1 and self._process is not None and self._process.pid is not None:
+                    metadata_update["detached_subprocess"] = True
+                    metadata_update["subprocess_pid"] = int(self._process.pid)
+                    try:
+                        import os as _os
+                        metadata_update["subprocess_pgid"] = _os.getpgid(int(self._process.pid))
+                    except (ProcessLookupError, PermissionError):
+                        pass
                 await self.store.update_session(
                     session_id,
                     status=SessionStatus.COMPLETED if exit_code == 0 else SessionStatus.FAILED,
                     exit_code=exit_code,
                     finished_at=datetime.now(timezone.utc),
+                    metadata=metadata_update or None,
                 )
 
             result_seq = await self._seq.next()
@@ -390,7 +416,7 @@ class StreamExecutor:
     async def _terminate_process(self) -> None:
         """Gracefully terminate the subprocess: SIGTERM, wait 5s, then SIGKILL.
 
-        v0.2.12: When ``start_new_session=True`` is set, the subprocess
+        v0.2.13: When ``start_new_session=True`` is set, the subprocess
         is in its own process group, so ``terminate()`` (which sends
         SIGTERM to the process only) is propagated. We also send SIGTERM
         to the process group to catch any grandchildren, then SIGKILL
@@ -421,7 +447,7 @@ class StreamExecutor:
                 pass
 
     async def force_terminate_process_group(self) -> None:
-        """v0.2.12: Force-kill the subprocess's process group.
+        """v0.2.13: Force-kill the subprocess's process group.
 
         When ``start_new_session=True`` is set, the subprocess is detached
         from the wrapper's process group, so the wrapper's SIGTERM is not

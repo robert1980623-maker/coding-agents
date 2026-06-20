@@ -76,7 +76,7 @@ def _get_storage() -> SQLiteStorage:
 def _run_async(coro: Any) -> Any:
     """Run an async function in a sync CLI context.
 
-    v0.2.12: asyncio.run() does not propagate BaseException like
+    v0.2.13: asyncio.run() does not propagate BaseException like
     SystemExit to the outer code — it logs "Task exception was never
     retrieved" and returns normally. We catch SystemExit here and
     re-raise so the process exits with the correct POSIX code
@@ -225,12 +225,19 @@ async def _run_session(
 
     def _on_signal(signum: int) -> None:
         _received_signal["signal"] = signum
-        # SystemExit is a BaseException that triggers finally blocks.
-        # The exit code follows the POSIX convention: 128 + signum.
-        # Note: with start_new_session=True (v0.2.12), the wrapper's
-        # SIGTERM is not propagated to the subprocess; the catch block
-        # below calls executor._terminate_process() to kill the
-        # process group and unblock the async for stdout pipe.
+        # SystemExit is a BaseException that propagates out of the event
+        # loop, so ``asyncio.run`` exits with code 128 + signum (POSIX
+        # convention). Combined with the v0.2.11 finally block that
+        # finalizes the session, this guarantees the session is moved
+        # out of ``running`` even if the wrapper is killed by SIGTERM
+        # / SIGINT (e.g. OpenClaw 1MB-buffer SIGKILL cascade).
+        #
+        # v0.2.13: with start_new_session=True, the subprocess is in
+        # its own process group and detached. The wrapper's SIGTERM
+        # is not propagated to the subprocess; it continues running.
+        # The executor's finally block uses a short wait timeout so
+        # the wrapper can exit without blocking on the detached
+        # subprocess.
         raise SystemExit(128 + signum)
 
     loop = asyncio.get_running_loop()
@@ -258,7 +265,7 @@ async def _run_session(
         if current is None:
             return
         if current.status != SessionStatus.RUNNING:
-            # v0.2.12: enrich metadata with signal info even if executor
+            # v0.2.13: enrich metadata with signal info even if executor
             # already finalized the session (it terminates the subprocess
             # and records exit_code=-15, but not the wrapper's signal).
             if sig is not None:
@@ -324,15 +331,24 @@ async def _run_session(
                 elif event.type == EventType.ERROR:
                     error_text = event.data
         except asyncio.CancelledError:
-            # v0.2.12: When asyncio's signal handler raises SystemExit,
+            # v0.2.13: When asyncio's signal handler raises SystemExit,
             # the running coroutine receives CancelledError instead.
             # We translate it back to SystemExit so the finally block
             # can finalize the session with the signal metadata.
+            #
+            # We do NOT call executor._terminate_process() here: with
+            # start_new_session=True the subprocess is in its own
+            # process group and detached. Killing it would defeat the
+            # point of v0.2.13's process-group design (the user expects
+            # to `tail` the subprocess's output after the wrapper dies).
+            # Instead, the executor's finally block uses a short
+            # wait_for(self._process.wait(), timeout=0.5) so the
+            # wrapper can exit cleanly without blocking on the
+            # detached subprocess.
             if _received_signal["signal"] is not None:
-                await executor._terminate_process()
                 raise SystemExit(128 + _received_signal["signal"])
             raise
-        # v0.2.12: If CancelledError was swallowed inside the executor's
+        # v0.2.13: If CancelledError was swallowed inside the executor's
         # async generator, the loop exits normally but the signal handler
         # already ran. Surface it as SystemExit so the outer finally
         # records the signal in session metadata.
@@ -490,9 +506,16 @@ def list_sessions(
     status: Optional[str] = typer.Option(None, help="Filter by status"),
     tag: Optional[str] = typer.Option(None, help="Filter by tag"),
     limit: int = typer.Option(100, help="Max results"),
+    short_id: bool = typer.Option(
+        False, "--short-id/--full-id",
+        help="Show only the first 8 characters of each session ID "
+             "(--short-id) or the full 36-character UUID (--full-id, the "
+             "default). The full UUID is the default so it can be copy-"
+             "pasted directly into `status` / `tail` / `kill`.",
+    ),
 ) -> None:
     """List sessions."""
-    _run_async(_list_sessions(agent, status, tag, limit))
+    _run_async(_list_sessions(agent, status, tag, limit, short_id))
 
 
 async def _list_sessions(
@@ -500,6 +523,7 @@ async def _list_sessions(
     status: Optional[str],
     tag: Optional[str],
     limit: int,
+    short_id: bool = False,
 ) -> None:
     storage = _get_storage()
     await storage.initialize()
@@ -509,8 +533,25 @@ async def _list_sessions(
         if not sessions:
             console.print("[dim]No sessions found.[/dim]")
             return
+        # v0.2.13: default to full 36-char UUID so users can copy-paste
+        # into `status` / `tail` / `kill` without first running `tail`
+        # to find the missing 28 characters. `--short-id` opts back
+        # into the compact view for users who prefer it.
+        def _format_id(sid: str) -> str:
+            return sid[:8] if short_id else sid
+
+        # v0.2.13: render the table on a 160-char-wide console so the full
+        # 36-char UUID fits on a single line, copy-pasteable into status/tail/
+        # kill. The default 80-char terminal wraps the UUID across multiple
+        # lines which made the CEO's copy-paste workflow impossible. We use
+        # a temporary Console (captures to a StringIO) and then echo its
+        # output via the global `console` (which respects the user's tty
+        # for color/style).
+        import io
+        _buf = io.StringIO()
+        _wide = Console(file=_buf, width=160, force_terminal=False)
         table = Table(title="Sessions")
-        table.add_column("ID", style="cyan", overflow="fold")
+        table.add_column("ID", style="cyan", no_wrap=True)  # full UUID; column expands
         table.add_column("Agent", style="magenta")
         table.add_column("Status", style="green")
         table.add_column("Started")
@@ -522,14 +563,21 @@ async def _list_sessions(
             dur = str(s.duration_ms) if s.duration_ms is not None else "-"
             prompt_short = s.prompt[:60] + "..." if len(s.prompt) > 60 else s.prompt
             table.add_row(
-                s.id,
+                _format_id(s.id),
                 s.agent.value,
                 s.status.value,
                 started,
                 dur,
                 prompt_short,
             )
-        console.print(table)
+        # v0.2.13: Render with no terminal width constraint so the full
+        # UUID fits on one line. We capture to a string buffer, then
+        # write the raw bytes to stdout so the wide table is preserved
+        # (the global `console` would otherwise re-wrap at its detected
+        # terminal width).
+        _wide.print(table)
+        sys.stdout.write(_buf.getvalue())
+        sys.stdout.flush()
     finally:
         await storage.close()
 
@@ -553,6 +601,11 @@ async def _search_events(query: str, agent: Optional[str], limit: int) -> None:
             console.print("[dim]No matching events found.[/dim]")
             return
         for ev in events:
+            # v0.2.13: print each event line on its own line, prefixed
+            # with the full 36-char UUID. We use ``console.print`` so
+            # the search output respects the user's terminal width
+            # (the [cyan] tag is a no-op for the UUID's 36 chars on
+            # wide terminals and folds on narrow ones).
             console.print(
                 f"[cyan]{ev.session_id}[/cyan] [{ev.channel}] {ev.data.strip()}"
             )

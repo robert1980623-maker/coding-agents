@@ -306,7 +306,7 @@ class TestFlush:
 
 
 class TestSubprocessProcessGroup:
-    """v0.2.12: subprocess must run in its own process group so wrapper
+    """v0.2.13: subprocess must run in its own process group so wrapper
     SIGTERM/SIGKILL doesn't propagate to it."""
 
     async def test_subprocess_runs_in_new_session(
@@ -339,3 +339,187 @@ class TestSubprocessProcessGroup:
             f"subprocess should be in a new session "
             f"(wrapper sid={wrapper_sid}, child sid={child_sid})"
         )
+
+
+def test_subprocess_detached_process_group(tmp_path: Path):
+    """v0.2.13: When the wrapper receives SIGTERM, the spawned subprocess
+    must CONTINUE running (because start_new_session=True detaches it into
+    its own process group), and the session must be marked FAILED.
+
+    This is the "active detach" design from the architect feedback: wrapper
+    death (e.g. OpenClaw 1MB-buffer SIGKILL cascade) does NOT cascade to
+    the agent subprocess. The user can still ``tail`` the agent's output
+    after the wrapper is gone.
+
+    Subprocess-based: we spawn the wrapper as a real OS process, send it
+    SIGTERM, then check ``ps`` for the child and the DB for the session
+    status. In-process tests cannot reproduce the OS-level process group
+    semantics.
+
+    The child PID is read from the SQLite session row (the executor
+    stores ``pid`` on the session after subprocess launch). This avoids
+    the v0.2.6 bounded-output contract, which keeps intermediate agent
+    output out of the wrapper's stdout.
+    """
+    import os
+    import signal
+    import subprocess
+    import sys as _sys
+    import time
+    from pathlib import Path as _Path
+
+    from coding_agents.models import SessionStatus
+    from coding_agents.storage.sqlite import SQLiteStorage
+
+    db_path = tmp_path / "test.db"
+
+    # The fake agent spawns a long-running Python subprocess that just
+    # sleeps. The wrapper will receive SIGTERM while it is sleeping,
+    # so we can verify the subprocess is detached (still alive) after
+    # the wrapper dies.
+    script = f"""
+import sys, os
+sys.path.insert(0, '{_Path(__file__).parent.parent / "src"}')
+
+from unittest.mock import patch
+from coding_agents.cli import app
+
+class FakeAdapter:
+    def build_command(self, prompt, config):
+        return [
+            {_sys.executable!r}, "-c",
+            "import time; time.sleep(120)",
+        ]
+
+with patch("coding_agents.cli.get_agent", return_value=FakeAdapter()):
+    os.environ["CODING_AGENTS_DB"] = {str(db_path)!r}
+    app(["dispatch", "claude", "test detached subprocess"])
+"""
+
+    # Start the wrapper as a real OS process.
+    proc = subprocess.Popen(
+        [_sys.executable, "-c", script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    child_pid = None
+    child_pgid = None
+    try:
+        # Wait for the session row to be populated with the subprocess
+        # PID. The executor sets session.pid right after create_subprocess_exec.
+        async def _read_child_pid():
+            store = SQLiteStorage(str(db_path))
+            await store.initialize()
+            try:
+                deadline = time.time() + 10.0
+                while time.time() < deadline:
+                    sessions = await store.list_sessions()
+                    if sessions and sessions[0].pid is not None:
+                        return int(sessions[0].pid)
+                    await asyncio.sleep(0.05)
+                return None
+            finally:
+                await store.close()
+
+        child_pid = asyncio.run(_read_child_pid())
+        assert child_pid is not None, (
+            f"subprocess PID was never recorded in the session row within 10s. "
+            f"This means the executor never reached the RUNNING state, or "
+            f"the database is in an unexpected state."
+        )
+        child_pgid = os.getpgid(child_pid)
+
+        # Sanity check: the subprocess is alive before we send SIGTERM.
+        try:
+            os.kill(child_pid, 0)
+            child_alive_before = True
+        except ProcessLookupError:
+            child_alive_before = False
+        assert child_alive_before, (
+            f"subprocess pid={child_pid} is already dead before we even "
+            f"sent SIGTERM to the wrapper"
+        )
+
+        # v0.2.13 invariant: child is in a different process group
+        # from the wrapper, so wrapper SIGTERM does not propagate.
+        assert child_pgid != os.getpgid(0), (
+            f"subprocess is in the same process group as the test "
+            f"(pgid={child_pgid}); start_new_session=True is not in effect"
+        )
+
+        # Send SIGTERM to the wrapper.
+        proc.send_signal(signal.SIGTERM)
+
+        # Wait for the wrapper to exit. v0.2.13's signal handler
+        # converts SIGTERM into SystemExit, the executor's finally
+        # block uses a 0.5s wait timeout for the detached subprocess,
+        # the dispatch finally block finalizes the session as FAILED.
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            pytest.fail(
+                "wrapper did not exit within 10s after SIGTERM. "
+                "v0.2.13's executor should not block on the detached subprocess."
+            )
+
+        # POSIX exit code: 128 + SIGTERM(15) = 143
+        assert proc.returncode == 128 + signal.SIGTERM, (
+            f"expected exit code {128 + signal.SIGTERM} (POSIX), got {proc.returncode}"
+        )
+
+        # The detached subprocess MUST still be alive: the wrapper's
+        # SIGTERM was not propagated because start_new_session=True
+        # put the child in its own process group (active detach).
+        try:
+            os.kill(child_pid, 0)
+            child_alive_after = True
+        except ProcessLookupError:
+            child_alive_after = False
+        assert child_alive_after, (
+            f"subprocess pid={child_pid} was killed when the wrapper "
+            f"died -- v0.2.13's start_new_session=True should have "
+            f"detached it into its own process group. This is a "
+            f"regression of the active-detach design."
+        )
+
+        # The session must be marked FAILED (v0.2.11 signal handler
+        # contract that v0.2.13 inherits and extends).
+        async def _check_session():
+            store = SQLiteStorage(str(db_path))
+            await store.initialize()
+            try:
+                sessions = await store.list_sessions()
+                assert len(sessions) == 1, (
+                    f"expected 1 session, got {len(sessions)}"
+                )
+                s = sessions[0]
+                assert s.status == SessionStatus.FAILED, (
+                    f"expected FAILED (v0.2.11 signal handler), got {s.status.value}"
+                )
+                assert s.metadata is not None
+                assert s.metadata.get("signal") == signal.SIGTERM, (
+                    f"expected signal metadata SIGTERM, got {s.metadata!r}"
+                )
+            finally:
+                await store.close()
+
+        asyncio.run(_check_session())
+
+    finally:
+        # Cleanup: kill the entire detached process group (we own the
+        # subprocess as a side-effect of spawning it). Best-effort and
+        # never raises -- pytest cleanup must be idempotent.
+        if child_pgid is not None:
+            try:
+                os.killpg(child_pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        if proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
