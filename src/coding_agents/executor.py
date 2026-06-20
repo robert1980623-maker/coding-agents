@@ -186,6 +186,7 @@ class StreamExecutor:
             try:
                 assert self._process is not None and self._process.stdout is not None
                 async for line in self._process.stdout:
+                    self._last_stdout_activity = time.monotonic()
                     seq = await self._seq.next()
                     text = line.decode(errors="replace")
                     event = Event(
@@ -356,13 +357,23 @@ class StreamExecutor:
         Extracted from stdout_reader so the heavy store.update_session call
         (asyncio.Lock + asyncio.to_thread + DB commit) does not block the
         stdout hot path.
+
+        Only writes when stdout has produced activity since the last write —
+        preserves the original semantic where the heartbeat represents
+        "process is producing output", not just "process exists". The idle
+        watchdog relies on this: if no output arrives, heartbeat stops
+        advancing, and the watchdog eventually kills the process.
         """
+        last_written_activity: float = 0.0
         try:
             while True:
                 await asyncio.sleep(1)
-                await self.store.update_session(
-                    session_id, last_heartbeat_at=datetime.now(timezone.utc)
-                )
+                activity = self._last_stdout_activity
+                if activity > last_written_activity:
+                    await self.store.update_session(
+                        session_id, last_heartbeat_at=datetime.now(timezone.utc)
+                    )
+                    last_written_activity = activity
         except asyncio.CancelledError:
             raise
 
