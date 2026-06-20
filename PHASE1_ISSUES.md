@@ -93,13 +93,14 @@ Phase 1 实施 + 质量审计 + 集成测试未发现 P0 级问题。102+30 测�
 - **建议**: 在 `sqlite.py` 的 f-string SQL 处加 `# nosec B608` 注释
 - **实施**: 已在 3 处 f-string 添加 `# nosec B608`，bandit medium 降至 0
 
-#### P2-2: 真实 Claude/Codex E2E 测试覆盖率低
+#### P2-2: 真实 Claude/Codex E2E 测试覆盖率低 ✅ 已修 (v0.2.0 S4)
 
 - **来源**: 集成测试 7 个 skip
 - **影响**: 未验证与真实 Claude/Codex CLI 集成（仅单元测试 mock）
 - **建议**: 
   - 在 CI 中配置 ANTHROPIC_API_KEY 跑真实测试
   - 或用 mock server（WireMock）模拟 API
+- **实施**: 新增 `tests/integration/real_e2e/`，用 mock CLI server 替代 API key，验证完整 pipeline（Agent.build_command → StreamExecutor.execute → parse_output）。6 个新测试通过。
 
 #### P2-3: CLI 输出体验 ✅ 已修 (v0.2.0 S1)
 
@@ -107,10 +108,11 @@ Phase 1 实施 + 质量审计 + 集成测试未发现 P0 级问题。102+30 测�
 - **建议**: 加 `--stream` 选项，实时打印 stdout/stderr
 - **实施**: `run --stream` 实时打印 `[channel seq=N] data` 到 stderr，默认模式只显示最终结果
 
-#### P2-4: 无 session 重试机制
+#### P2-4: 无 session 重试机制 ✅ 已修 (v0.2.0 S4)
 
 - **影响**: ExecutionConfig 有 `max_retries` 字段，但 executor 未实现
 - **建议**: Phase 2 添加 retry 逻辑（指数退避）
+- **实施**: 新增 `retry.py`（RetryPolicy + with_retry + with_retry_generator）+ `retry_integration.py`（make_executor_with_retry wrapper）。支持指数退避、指定 retry_on 异常类型、generator 重试。14 个测试通过。
 
 #### P2-5: 无 session 恢复（执行续跑）
 
@@ -129,10 +131,11 @@ Phase 1 实施 + 质量审计 + 集成测试未发现 P0 级问题。102+30 测�
 - **建议**: 引入 structlog，统一 JSON 日志
 - **实施**: 迁移全部 src 到 structlog，JSON 输出 + 标准化字段 + CLI 全局选项 --log-level/--log-json
 
-#### P2-8: 无性能基准
+#### P2-8: 无性能基准 ✅ 已修 (v0.2.0 S4)
 
 - **影响**: 内存基线测试只验证 < 50MB，未做 30min 长任务基准
 - **建议**: 加 benchmark 套件
+- **实施**: 新增 `tests/benchmarks/`，用 mock subprocess 模拟 5min 任务（压缩 30min），测量内存峰值/CPU/事件吞吐。3 个基准测试：内存 < 50MB、吞吐 > 100 events/sec、5 并发 < 100MB。
 
 ---
 
