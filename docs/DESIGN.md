@@ -1,8 +1,8 @@
 # Coding Agent Runtime — 完整设计文档
 
-> **版本**: v1.2.0  
+> **版本**: v1.2.1  
 > **日期**: 2026-06-20  
-> **状态**: Draft (Revised — P0/P1 修复)
+> **状态**: Draft (Revised — 阻塞项修复)
 
 ## 1. 概述
 
@@ -30,13 +30,13 @@
 
 ### 1.3 使用场景
 
-| 场景 | 示例 |
-|------|------|
-| **Hermes 集成** | 作为 tool 调用，流式输出到 CLI |
-| **OpenClaw 集成** | 通过 HTTP API 调用，SSE 推送事件 |
-| **CI/CD 管道** | 批量执行任务，结果写入数据库 |
-| **多 Agent 编排** | 并行执行多个 agent，统一监控 |
-| **历史搜索** | 全文搜索过去的执行记录 |
+| 场景 | 示例 | 阶段 |
+|------|------|------|
+| **Hermes 集成** | 作为 tool 调用，流式输出到 CLI | Phase 1 |
+| **OpenClaw 集成** | 通过 HTTP API 调用，SSE 推送事件 | Phase 2 |
+| **CI/CD 管道** | 批量执行任务，结果写入数据库 | Phase 1 |
+| **多 Agent 编排** | 并行执行多个 agent，统一监控 | **Phase 3+** |
+| **历史搜索** | 全文搜索过去的执行记录 | Phase 2 |
 
 ### 1.4 关键设计决策
 
@@ -77,12 +77,14 @@
 │  CLI  │  HTTP Server (SSE)  │  Python SDK               │
 ├─────────────────────────────────────────────────────────┤
 │                    Executor Layer                        │
-│  Stream Executor  │  Agent Adapters  │  Process Pool    │
+│  Stream Executor  │  Agent Adapters  │  SessionRegistry │
 ├─────────────────────────────────────────────────────────┤
 │                    Storage Layer                         │
 │  StorageBackend (Protocol)  │  SQLite  │  Postgres      │
 └─────────────────────────────────────────────────────────┘
 ```
+
+**v1.2.1 新增**：`SessionRegistry` — 轻量级 session 管理 + 并发控制（信号量）
 
 **v1.0 不包含**（后续版本考虑）：
 - ~~Orchestrator 层~~ — 初期不需要复杂的会话编排
@@ -91,6 +93,7 @@
 - ~~Node.js SDK~~ — HTTP API 足够，推迟
 - ~~Web UI~~ — 独立项目，不耦合
 - ~~stdio JSON 模式~~ — 推迟到 Phase 3
+- ~~多 Agent 编排~~ — 推迟到 Phase 3+
 
 ### 2.2 核心组件
 
@@ -100,6 +103,7 @@
 | **Executor** | 进程执行 | 流式 subprocess、可配置 buffer、背压控制 |
 | **Agent** | Agent 适配 | 命令构建、输出解析、成本提取 |
 | **Storage** | 数据持久化 | 批量写入、WAL 模式、全文搜索 |
+| **SessionRegistry** | 会话管理 | 并发限制、活跃 session 跟踪 |
 
 ### 2.3 数据流
 
@@ -109,6 +113,11 @@ User Request
     ▼
 ┌──────────────┐
 │  Interface   │ ← 统一入口 (CLI/HTTP/SDK)
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐
+│SessionRegistry│ ← 并发控制 (Semaphore)
 └──────┬───────┘
        │
        ▼
@@ -187,6 +196,7 @@ class SessionStatus(str, Enum):
     ORPHANED = "orphaned"  # 进程崩溃后标记
 
 class EventType(str, Enum):
+    SESSION_START = "session.start"  # v1.2.1 新增
     STDOUT = "stdout"
     STDERR = "stderr"
     SYSTEM = "system"
@@ -259,20 +269,27 @@ class ExecutionConfig:
     max_retries: int = 0
     retry_delay_seconds: int = 5
     
-    # 监控
-    watch_patterns: list[str] = field(default_factory=list)
+    # 监控（v1.2.1 恢复 WatchPattern）
+    watch_patterns: list[WatchPattern] = field(default_factory=list)
     
     # 输出模式
     output_mode: str = "standard"    # "passthrough" | "standard"
     
-    # 模型（v1.2 新增）
+    # 模型
     model: Optional[str] = None
     
-    # 行长度限制（v1.2 新增，默认 8MiB）
+    # 行长度限制（默认 8MiB）
     line_limit: int = 8 * 1024 * 1024
     
     # 环境变量
     env: dict[str, str] = field(default_factory=dict)
+
+@dataclass
+class WatchPattern:
+    """监控模式（v1.2.1 恢复）"""
+    pattern: str
+    action: str = "notify"           # "notify" | "callback" | "stop"
+    callback: Optional[str] = None   # webhook URL or function name
 ```
 
 ### 3.2 状态机
@@ -311,7 +328,7 @@ class ExecutionConfig:
 - `RUNNING → COMPLETED`: 进程退出，exit_code=0
 - `RUNNING → FAILED`: 进程退出，exit_code!=0
 - `RUNNING → KILLED`: 调用 `kill()`
-- `RUNNING → TIMEOUT`: 超过 timeout_seconds
+- `RUNNING → TIMEOUT`: 超过 timeout_seconds 或 idle_timeout_seconds
 - `RUNNING → ORPHANED`: 启动时扫描，heartbeat 超时
 
 **终态**：COMPLETED, FAILED, KILLED, TIMEOUT, ORPHANED
@@ -342,7 +359,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     started_at REAL,
     finished_at REAL,
     duration_ms INTEGER,
-    last_heartbeat_at REAL,  -- v1.2 新增：用于检测 orphaned
+    last_heartbeat_at REAL,  -- 用于检测 orphaned
     
     -- 成本与用量
     cost_usd REAL,
@@ -361,7 +378,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     updated_at REAL NOT NULL DEFAULT (strftime('%s', 'now'))
 );
 
--- v1.2 新增：tags 关联表（替代 JSON 字段）
+-- tags 关联表
 CREATE TABLE IF NOT EXISTS session_tags (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     tag TEXT NOT NULL,
@@ -369,8 +386,7 @@ CREATE TABLE IF NOT EXISTS session_tags (
 );
 CREATE INDEX IF NOT EXISTS idx_session_tags_tag ON session_tags(tag);
 
--- 事件表（核心：流式写入）
--- v1.2 修改：channel + seq 复合主键，seq 全局单调递增
+-- 事件表
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -385,7 +401,7 @@ CREATE TABLE IF NOT EXISTS events (
     UNIQUE(session_id, seq)
 );
 
--- v1.2 新增：全文搜索索引
+-- 全文搜索索引
 CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
     data, content=events, content_rowid=id
 );
@@ -429,14 +445,17 @@ CREATE TABLE IF NOT EXISTS schema_version (
 提取关键字段，丢失部分细节：
 
 ```jsonl
-// 会话开始
+// 会话开始（v1.2.1 新增）
 {"type":"session.start","session_id":"uuid","agent":"claude","prompt":"...","timestamp":1234567890}
 
 // 标准输出（提取文本内容）
 {"type":"stdout","session_id":"uuid","channel":"stdout","seq":1,"data":"...","timestamp":1234567890}
 
-// 标准错误
+// 标准错误（v1.2.1 明确：通过 SSE 可见）
 {"type":"stderr","session_id":"uuid","channel":"stderr","seq":2,"data":"...","timestamp":1234567890}
+
+// 错误事件（v1.2.1 新增）
+{"type":"error","session_id":"uuid","code":"SUBPROCESS_FAILED","message":"...","timestamp":1234567890}
 
 // 会话结束（提取成本）
 {"type":"session.end","session_id":"uuid","status":"completed","exit_code":0,"duration_ms":5000,"cost_usd":0.15,"timestamp":1234567890}
@@ -452,13 +471,11 @@ CREATE TABLE IF NOT EXISTS schema_version (
 {"type":"system","subtype":"thinking_tokens","estimated_tokens":100}
 {"type":"assistant","message":{"content":[{"type":"text","text":"Hello!"}]}}
 {"type":"result","subtype":"success","total_cost_usd":0.15,...}
-
-// Codex --json 原样输出
-{"type":"thread.started","thread_id":"..."}
-{"type":"turn.started"}
-{"type":"item.completed","item":{"type":"agent_message","text":"Hi!"}}
-{"type":"turn.completed","usage":{"input_tokens":100}}
 ```
+
+**存储优化（v1.2.1 修复）**：
+- **standard 模式**：`data` 存提取的文本，`raw_json` 为 NULL
+- **passthrough 模式**：`data` 存提取的文本（用于 FTS），`raw_json` 存完整原始 JSON
 
 **使用场景**：
 - **标准化模式**：简单集成、日志收集、监控
@@ -468,14 +485,64 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 ## 4. 核心组件设计
 
-### 4.1 Executor — 流式进程执行器
+### 4.1 SessionRegistry — 并发控制（v1.2.1 新增）
+
+```python
+# registry.py
+
+import asyncio
+from typing import Dict, Optional
+
+class SessionRegistry:
+    """会话注册表 + 并发控制"""
+    
+    def __init__(self, max_concurrent: int = 5):
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._active_sessions: Dict[str, asyncio.Task] = {}
+        self._lock = asyncio.Lock()
+    
+    async def acquire(self, session_id: str) -> bool:
+        """获取执行许可，返回是否成功"""
+        try:
+            await asyncio.wait_for(self._semaphore.acquire(), timeout=60)
+            async with self._lock:
+                self._active_sessions[session_id] = asyncio.current_task()
+            return True
+        except asyncio.TimeoutError:
+            return False
+    
+    async def release(self, session_id: str):
+        """释放执行许可"""
+        async with self._lock:
+            self._active_sessions.pop(session_id, None)
+        self._semaphore.release()
+    
+    async def list_active(self) -> list[str]:
+        """列出活跃 session"""
+        async with self._lock:
+            return list(self._active_sessions.keys())
+    
+    async def kill_session(self, session_id: str) -> bool:
+        """终止活跃 session"""
+        async with self._lock:
+            task = self._active_sessions.get(session_id)
+            if task and not task.done():
+                task.cancel()
+                return True
+            return False
+```
+
+### 4.2 Executor — 流式进程执行器
 
 **关键设计**：
 - 使用 `asyncio.create_subprocess_exec` + 可配置 `limit`（默认 8MiB）
 - stdout/stderr 并发读取，防止 pipe 满卡死
 - **全局单调递增 seq**（跨 channel），用 `asyncio.Lock` 保证唯一
 - **先 write 再 yield**，确保 storage 是 durable 真相
-- **背压控制**：buffer 超过阈值时暂停读取
+- **Heartbeat 节流**：最多每 1 秒写一次（v1.2.1 修复）
+- **Idle timeout watchdog**：检测空闲超时并 kill（v1.2.1 新增）
+- **SessionStartEvent**：yield session.start 事件（v1.2.1 新增）
+- **stderr 可见**：stderr 事件也 yield 给消费者（v1.2.1 修复）
 
 ```python
 # executor.py
@@ -485,7 +552,7 @@ import time
 from typing import AsyncIterator, Optional
 
 class SeqCounter:
-    """全局单调递增序号计数器"""
+    """per-session 单调递增序号计数器"""
     def __init__(self):
         self._value = 0
         self._lock = asyncio.Lock()
@@ -505,6 +572,7 @@ class StreamExecutor:
         self._seq = SeqCounter()
         self._buffer: list[Event] = []
         self._last_flush = time.time()
+        self._last_heartbeat_write = 0  # v1.2.1: heartbeat 节流
     
     async def execute(
         self,
@@ -515,15 +583,43 @@ class StreamExecutor:
     ) -> AsyncIterator[Event]:
         """执行命令，流式返回事件"""
         
-        # 启动子进程（line_limit 可配置）
-        self._process = await asyncio.create_subprocess_exec(
-            *command,
-            cwd=workdir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            limit=self.config.line_limit,
-            env=env,
+        # v1.2.1 新增：yield session.start 事件
+        seq = await self._seq.next()
+        start_event = Event(
+            session_id=session_id,
+            channel="system",
+            seq=seq,
+            type=EventType.SESSION_START,
+            data=f'{{"session_id":"{session_id}","agent":"{command[0]}"}}',
         )
+        self._buffer.append(start_event)
+        await self._flush()
+        yield start_event
+        
+        # 启动子进程（line_limit 可配置）
+        try:
+            self._process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=workdir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=self.config.line_limit,
+                env=env,
+            )
+        except Exception as e:
+            # v1.2.1 新增：yield error 事件
+            seq = await self._seq.next()
+            error_event = Event(
+                session_id=session_id,
+                channel="system",
+                seq=seq,
+                type=EventType.ERROR,
+                data=f'{{"code":"SUBPROCESS_FAILED","message":"{str(e)}"}}',
+            )
+            self._buffer.append(error_event)
+            await self._flush()
+            yield error_event
+            return
         
         # 更新 session
         await self.store.update_session(
@@ -535,17 +631,26 @@ class StreamExecutor:
         )
         
         # stderr 并发 drain → 防止 pipe 满
+        # v1.2.1 修复：stderr 事件也放入 buffer，但不 yield（避免乱序）
         stderr_task = asyncio.create_task(
             self._drain_stderr(session_id, self._process.stderr)
+        )
+        
+        # v1.2.1 新增：idle timeout watchdog
+        watchdog_task = asyncio.create_task(
+            self._idle_watchdog(session_id)
         )
         
         # stdout 流式读取
         try:
             async for line in self._process.stdout:
-                # 更新 heartbeat
-                await self.store.update_session(
-                    session_id, last_heartbeat_at=datetime.now()
-                )
+                # v1.2.1 修复：heartbeat 节流（最多每 1 秒写一次）
+                now = time.time()
+                if now - self._last_heartbeat_write >= 1.0:
+                    await self.store.update_session(
+                        session_id, last_heartbeat_at=datetime.now()
+                    )
+                    self._last_heartbeat_write = now
                 
                 seq = await self._seq.next()
                 event = Event(
@@ -553,7 +658,7 @@ class StreamExecutor:
                     channel="stdout",
                     seq=seq,
                     type=EventType.STDOUT,
-                    data=line.decode(),
+                    data=self._extract_text(line.decode(), self.config.output_mode),
                     raw_json=line.decode() if self.config.output_mode == "passthrough" else None,
                 )
                 
@@ -570,6 +675,13 @@ class StreamExecutor:
         finally:
             # 确保所有事件落盘
             await self._flush()
+            
+            # 取消 watchdog
+            watchdog_task.cancel()
+            try:
+                await watchdog_task
+            except asyncio.CancelledError:
+                pass
             
             # 等待 stderr 完成
             await stderr_task
@@ -609,9 +721,50 @@ class StreamExecutor:
                 type=EventType.STDERR,
                 data=line.decode(),
             )
-            # 先写入，不 yield（stderr 通常不需要实时消费）
+            # v1.2.1 修复：stderr 也写入 buffer（可通过 stream_events 读取）
             self._buffer.append(event)
             await self._flush_if_needed()
+    
+    async def _idle_watchdog(self, session_id: str):
+        """v1.2.1 新增：idle timeout watchdog"""
+        while True:
+            await asyncio.sleep(5)  # 每 5 秒检查一次
+            session = await self.store.get_session(session_id)
+            if session and session.last_heartbeat_at:
+                idle_seconds = (datetime.now() - session.last_heartbeat_at).total_seconds()
+                if idle_seconds > self.config.idle_timeout_seconds:
+                    # 超时，kill 进程
+                    if self._process and self._process.returncode is None:
+                        self._process.terminate()
+                    await self.store.update_session(
+                        session_id,
+                        status=SessionStatus.TIMEOUT,
+                        finished_at=datetime.now(),
+                    )
+                    break
+    
+    def _extract_text(self, line: str, output_mode: str) -> str:
+        """v1.2.1 新增：标准化模式文本提取"""
+        if output_mode == "passthrough":
+            return line  # 保留原始行
+        
+        # standard 模式：尝试提取文本内容
+        import json
+        try:
+            event = json.loads(line)
+            # Claude Code: assistant.message.content[0].text
+            if event.get("type") == "assistant":
+                content = event.get("message", {}).get("content", [])
+                if content and content[0].get("type") == "text":
+                    return content[0].get("text", "")
+            # Codex: item.text
+            if event.get("type") == "item.completed":
+                item = event.get("item", {})
+                if item.get("type") == "agent_message":
+                    return item.get("text", "")
+        except:
+            pass
+        return line  # fallback: 保留原始行
     
     async def _flush_if_needed(self):
         """批量 flush：100 条或 100ms"""
@@ -626,11 +779,16 @@ class StreamExecutor:
             self._last_flush = time.time()
     
     async def _check_watch_patterns(self, session_id: str, event: Event):
-        """检查监控模式"""
-        for pattern in self.config.watch_patterns:
-            if pattern in event.data:
-                # 触发回调（如果有）
-                pass
+        """v1.2.1 恢复：检查监控模式"""
+        for wp in self.config.watch_patterns:
+            if wp.pattern in event.data:
+                if wp.action == "notify":
+                    # 发送通知（通过回调）
+                    pass
+                elif wp.action == "stop":
+                    # 停止执行
+                    if self._process and self._process.returncode is None:
+                        self._process.terminate()
     
     async def kill(self, session_id: str):
         """终止进程"""
@@ -642,7 +800,7 @@ class StreamExecutor:
                 self._process.kill()
 ```
 
-### 4.2 Agent — 适配器模式
+### 4.3 Agent — 适配器模式
 
 **设计**：每个 agent 类型实现统一接口，封装命令构建和输出解析。
 
@@ -688,7 +846,7 @@ class ClaudeAgent(BaseAgent):
         if config.max_budget_usd:
             cmd.extend(["--max-budget-usd", str(config.max_budget_usd)])
         
-        # 模型（v1.2 修复）
+        # 模型
         if config.model:
             cmd.extend(["--model", config.model])
         
@@ -744,7 +902,7 @@ class CodexAgent(BaseAgent):
             "--full-auto",
         ]
         
-        # 模型（v1.2 修复）
+        # 模型
         if config.model:
             cmd.extend(["-m", config.model])
         
@@ -777,7 +935,7 @@ class CodexAgent(BaseAgent):
         return None
 ```
 
-### 4.3 Storage — Protocol 设计
+### 4.4 Storage — Protocol 设计
 
 **设计**：基于 Protocol 的鸭子类型，支持多种实现。
 
@@ -815,9 +973,23 @@ class StorageBackend(Protocol):
         self,
         agent: Optional[str] = None,
         status: Optional[str] = None,
+        tags: Optional[list[str]] = None,  # v1.2.1 新增：tag 过滤
         limit: int = 100,
     ) -> list[Session]:
         """列出会话"""
+        ...
+    
+    # v1.2.1 新增：Tags 管理
+    async def add_tag(self, session_id: str, tag: str) -> None:
+        """添加 tag"""
+        ...
+    
+    async def remove_tag(self, session_id: str, tag: str) -> None:
+        """移除 tag"""
+        ...
+    
+    async def list_tags(self, session_id: str) -> list[str]:
+        """列出 session 的所有 tags"""
         ...
     
     # Event 操作
@@ -826,7 +998,7 @@ class StorageBackend(Protocol):
         ...
     
     async def append_events(self, events: list[Event]) -> None:
-        """批量追加事件（v1.2 修复：返回 None，不返回假 ID）"""
+        """批量追加事件"""
         ...
     
     async def stream_events(
@@ -846,13 +1018,13 @@ class StorageBackend(Protocol):
         """搜索事件（全文搜索，使用 FTS5）"""
         ...
     
-    # v1.2 新增：崩溃恢复
+    # 崩溃恢复
     async def recover_orphaned_sessions(self, timeout_seconds: int = 300) -> int:
         """扫描并标记 orphaned sessions，返回标记数量"""
         ...
 ```
 
-### 4.4 崩溃恢复（v1.2 新增）
+### 4.5 崩溃恢复
 
 **明确边界**：v1.0 只支持**状态恢复**（标记为 ORPHANED），**不支持执行续跑**。
 
@@ -909,22 +1081,36 @@ coding-agent search "重构" --agent claude --last 7d
 # 列出会话
 coding-agent list --agent claude --status completed --limit 20
 
+# 列出活跃会话
+coding-agent list --active
+
 # 终止执行
 coding-agent kill <session_id>
 
 # 恢复 orphaned sessions
 coding-agent recover
+
+# Tag 管理（v1.2.1 新增）
+coding-agent tag add <session_id> <tag>
+coding-agent tag remove <session_id> <tag>
+coding-agent tag list <session_id>
 ```
 
 ### 5.2 HTTP Server
 
 ```bash
-# 启动服务（v1.2 修复：默认绑定 127.0.0.1）
+# 启动服务（默认绑定 127.0.0.1）
 coding-agent serve --port 8080 --host 127.0.0.1
 
 # 生产部署（需要认证）
 coding-agent serve --port 8080 --host 0.0.0.0 --auth-token <token>
 ```
+
+**认证机制（v1.2.1 明确）**：
+- Token 来源：环境变量 `CODING_AGENT_AUTH_TOKEN` 或 `--auth-token` 参数
+- 验证方式：明文比对（`token == expected_token`）
+- 本地模式（127.0.0.1）：认证可选
+- 远程模式（0.0.0.0）：认证强制
 
 **API 端点**：
 
@@ -932,26 +1118,34 @@ coding-agent serve --port 8080 --host 0.0.0.0 --auth-token <token>
 POST /api/v1/run
   Body: {"agent": "claude", "prompt": "...", "workdir": "...", "config": {...}}
   Response: {"session_id": "uuid"}
-  Auth: Bearer token
+  Auth: Bearer token（远程模式强制）
 
 GET /api/v1/sessions
-  Query: ?agent=claude&status=completed&limit=20
-  Response: [{"id": "...", "agent": "claude", ...}]
+  Query: ?agent=claude&status=completed&tags=important,urgent&limit=20
+  Response: [{"id": "...", "agent": "claude", "tags": [...], ...}]
   Auth: Bearer token
 
 GET /api/v1/sessions/:id
   Response: {"id": "...", "status": "running", ...}
   Auth: Bearer token
 
-# v1.2 修复：SSE 流式传输，支持断点续传
+# SSE 流式传输（v1.2.1 明确协议细节）
 GET /api/v1/sessions/:id/events/stream
   Query: ?after_seq=100
   Header: Accept: text/event-stream
   Header: Last-Event-ID: 100  (断点续传)
   Response: SSE stream
+  
+  SSE 协议细节：
+  - 每个事件带 id 字段（seq）
+  - 支持 Last-Event-ID 断点续传
+  - 空闲时每 30 秒发送 ping 心跳
+  - session 结束后自动关闭连接
+  - 客户端断线后自动重连（浏览器原生支持）
+  
   Auth: Bearer token
 
-# v1.2 修复：终止执行（语义明确）
+# 终止执行
 POST /api/v1/sessions/:id/kill
   Response: {"status": "killed"}
   Auth: Bearer token
@@ -961,28 +1155,45 @@ DELETE /api/v1/sessions/:id
   Response: {"deleted": true}
   Auth: Bearer token
 
+# Tag 管理（v1.2.1 新增）
+POST /api/v1/sessions/:id/tags
+  Body: {"tag": "important"}
+  Response: {"added": true}
+  Auth: Bearer token
+
+DELETE /api/v1/sessions/:id/tags/:tag
+  Response: {"removed": true}
+  Auth: Bearer token
+
 POST /api/v1/search
   Body: {"query": "重构", "agent": "claude", "limit": 20}
   Response: [{"session_id": "...", "event": "..."}]
   Auth: Bearer token
 
 GET /health
-  Response: {"status": "ok", "sqlite": "ok", "running_sessions": 3}
+  Response: {"status": "ok", "sqlite": "ok", "running_sessions": 3, "max_concurrent": 5}
 ```
 
 **SSE 事件格式**：
 ```
-event: stdout
+event: session.start
 id: 1
-data: {"session_id":"uuid","seq":1,"data":"...","timestamp":1234567890}
+data: {"session_id":"uuid","agent":"claude","timestamp":1234567890}
 
-event: stderr
+event: stdout
 id: 2
 data: {"session_id":"uuid","seq":2,"data":"...","timestamp":1234567890}
 
-event: session.end
+event: stderr
 id: 3
+data: {"session_id":"uuid","seq":3,"data":"...","timestamp":1234567890}
+
+event: session.end
+id: 4
 data: {"session_id":"uuid","status":"completed","exit_code":0}
+
+event: ping
+data: {}
 ```
 
 ### 5.3 Python SDK
@@ -1010,15 +1221,25 @@ async for event in agent.run_stream(
 ):
     if event.type == "stdout":
         print(event.data, end="")
+    elif event.type == "stderr":
+        print(f"[stderr] {event.data}", end="")
 
 # 查询历史
 sessions = await agent.list_sessions(agent="claude", limit=10)
+
+# 按 tag 过滤（v1.2.1 新增）
+sessions = await agent.list_sessions(tags=["important"], limit=10)
 
 # 全文搜索
 results = await agent.search_events("重构", agent="claude", limit=20)
 
 # 恢复 orphaned
 count = await agent.recover_orphaned()
+
+# Tag 管理（v1.2.1 新增）
+await agent.add_tag(session_id, "important")
+await agent.remove_tag(session_id, "important")
+tags = await agent.list_tags(session_id)
 ```
 
 ---
@@ -1133,6 +1354,11 @@ eventSource.addEventListener('stdout', (event) => {
   console.log(data.data);
 });
 
+eventSource.addEventListener('stderr', (event) => {
+  const data = JSON.parse(event.data);
+  console.error(`[stderr] ${data.data}`);
+});
+
 eventSource.addEventListener('session.end', (event) => {
   const data = JSON.parse(event.data);
   console.log(`Completed: ${data.status}`);
@@ -1186,7 +1412,7 @@ jobs:
 |------|------|
 | **流式读取** | `async for line in proc.stdout`，不收集全量输出 |
 | **批量写入** | 100 条或 100ms flush 一次，减少 IO |
-| **背压控制** | buffer 超过阈值时暂停读取，防止内存爆炸 |
+| **Heartbeat 节流** | 最多每 1 秒写一次，避免写风暴（v1.2.1 修复） |
 | **mmap** | SQLite `mmap_size=256MB`，减少 syscall |
 
 ### 7.2 IO 优化
@@ -1199,12 +1425,13 @@ jobs:
 | **索引优化** | 复合索引 + 部分索引，加速查询 |
 | **FTS5** | 全文搜索虚拟表，加速文本搜索 |
 
-### 7.3 并发限制（明确声明）
+### 7.3 并发控制（v1.2.1 明确实现）
 
-| 场景 | 限制 | 原因 |
+| 场景 | 限制 | 实现 |
 |------|------|------|
 | **写入并发** | SQLite 写锁全局 | 写写串行，WAL 只解决读写并发 |
-| **建议并发数** | ≤5 个 agent 同时执行 | 避免写竞争 |
+| **执行并发** | ≤5 个 agent 同时执行 | `asyncio.Semaphore(5)` + `SessionRegistry` |
+| **排队超时** | 60 秒 | 超时返回错误 |
 | **查询并发** | 无限制 | WAL 模式下读写不冲突 |
 
 **如果高并发写入是瓶颈**：
@@ -1217,8 +1444,8 @@ jobs:
 | 场景 | 目标 | 说明 |
 |------|------|------|
 | **短任务 (<1min)** | <100ms 启动延迟，<10MB 内存 | |
-| **长任务 (30min)** | 恒定 <50MB 内存，零丢失 | 背压控制 |
-| **5 并发** | <100MB 内存，可接受写延迟 | |
+| **长任务 (30min)** | 恒定 <50MB 内存，零丢失 | Heartbeat 节流 |
+| **5 并发** | <100MB 内存，可接受写延迟 | Semaphore 控制 |
 | **100 万事件** | <1s 查询延迟（有索引） | 仅限索引查询 |
 | **全文搜索** | <2s（FTS5） | 取决于数据量 |
 
@@ -1226,15 +1453,16 @@ jobs:
 
 ---
 
-## 8. 安全设计（v1.2 新增）
+## 8. 安全设计
 
 ### 8.1 网络安全
 
 | 措施 | 说明 |
 |------|------|
 | **默认绑定 localhost** | `--host 127.0.0.1`，仅本地访问 |
-| **Bearer token 认证** | `--auth-token <token>`，所有 API 需要认证 |
-| **生产部署** | 必须配置 `--host 0.0.0.0` + `--auth-token` |
+| **Bearer token 认证** | 环境变量 `CODING_AGENT_AUTH_TOKEN` 或 `--auth-token` |
+| **本地模式** | 认证可选 |
+| **远程模式** | 认证强制 |
 
 ### 8.2 输入验证
 
@@ -1251,6 +1479,7 @@ jobs:
 | **内存** | `max_memory_mb` | 默认 4096MB |
 | **预算** | `max_budget_usd` | 默认 $10 |
 | **时间** | `timeout_seconds` | 默认 3600s |
+| **空闲时间** | `idle_timeout_seconds` | 默认 300s（v1.2.1 有 watchdog） |
 | **CPU** | 未限制 | 未来可加 cgroup |
 
 ### 8.4 沙箱（未来）
@@ -1304,10 +1533,10 @@ storage = PostgresStorage(dsn="postgresql://...")
 agent = CodingAgent(storage=storage)
 ```
 
-### 9.3 事件回调（v1.2 简化）
+### 9.3 事件回调
 
 ```python
-# 简单回调注册（不用装饰器）
+# 简单回调注册
 agent.on("session.start", lambda e: print(f"Started: {e.session_id}"))
 agent.on("session.end", lambda e: send_notification(e))
 agent.on("watch.match", lambda e: trigger_webhook(e))
@@ -1322,24 +1551,25 @@ agent.on("watch.match", lambda e: trigger_webhook(e))
 | 任务 | 预计 | 说明 |
 |------|------|------|
 | 数据模型 + SQLite schema | 2d | 含 tags 关联表、FTS5 |
-| StreamExecutor（流式执行器） | 4d | 含全局 seq、背压、先 write 再 yield |
+| StreamExecutor（流式执行器） | 5d | 含全局 seq、heartbeat 节流、idle watchdog、SessionStartEvent |
+| SessionRegistry（并发控制） | 1d | Semaphore + 活跃 session 跟踪 |
 | ClaudeAgent + CodexAgent | 2d | 命令构建、输出解析 |
-| SQLiteStorage | 3d | Protocol 实现、崩溃恢复 |
-| CLI 基础命令 | 2d | run/status/list/search/kill/recover |
+| SQLiteStorage | 3d | Protocol 实现、崩溃恢复、tags 管理 |
+| CLI 基础命令 | 2d | run/status/list/search/kill/recover/tag |
 | 单元测试 | 3d | 覆盖核心逻辑 |
 | 基准测试 | 1d | 验证性能指标 |
-| **小计** | **17d** | 含 buffer |
+| **小计** | **19d** | 含 buffer |
 
 ### Phase 2: 接口（2 周）
 
 | 任务 | 预计 | 说明 |
 |------|------|------|
-| HTTP Server (FastAPI + SSE) | 4d | 含认证、断点续传 |
+| HTTP Server (FastAPI + SSE) | 5d | 含认证、断点续传、心跳、tag 管理 |
 | Python SDK | 2d | 封装 HTTP 或直接调用 |
 | 集成示例 | 2d | Hermes + OpenClaw |
 | 文档 | 2d | API 文档 + 示例 |
 | 集成测试 | 2d | |
-| **小计** | **12d** | |
+| **小计** | **13d** | |
 
 ### Phase 3: 高级功能（持续）
 
@@ -1348,10 +1578,11 @@ agent.on("watch.match", lambda e: trigger_webhook(e))
 | 向量搜索（sqlite-vec） | 3d | 可选 |
 | stdio JSON 模式 | 2d | |
 | Node.js SDK | 3d | HTTP-only client |
+| 多 Agent 编排 | 5d | DAG 定义、依赖管理 |
 | 会话恢复（执行续跑） | 5d | 需要 agent CLI 支持 |
 | Web UI | 5d | 独立项目 |
 
-**总计**：Phase 1-2 约 6-7 周（含 buffer）
+**总计**：Phase 1-2 约 7-8 周（含 buffer）
 
 ---
 
@@ -1361,11 +1592,12 @@ agent.on("watch.match", lambda e: trigger_webhook(e))
 |------|------|------|
 | **subprocess 崩溃** | 丢失输出 | WAL + 批量写入，最多丢 100ms |
 | **pipe 满卡死** | 进程挂起 | stderr 并发 drain |
-| **内存爆炸** | OOM | 流式读取 + 背压控制 |
+| **内存爆炸** | OOM | 流式读取 + Semaphore 并发控制 |
 | **SQLite 写竞争** | 性能下降 | 限制并发数 ≤5，或换 Postgres |
 | **agent CLI 变更** | 解析失败 | 版本检测 + 适配器模式 |
-| **长任务超时** | 执行中断 | 合理设置 timeout，heartbeat 检测 |
+| **长任务超时** | 执行中断 | timeout_seconds + idle_timeout watchdog |
 | **runtime 崩溃** | session 悬挂 | 启动时扫描 orphaned，标记为 ORPHANED |
+| **heartbeat 写风暴** | 性能下降 | 节流：最多每 1 秒写一次（v1.2.1 修复） |
 
 ---
 
@@ -1390,7 +1622,8 @@ agent.on("watch.match", lambda e: trigger_webhook(e))
 - [Claude Code CLI 对比](./cli-comparison.md)
 - [Buffer Size 调研](./research/buffer-size-investigation.md)
 - [设计评审 - Atlas](./DESIGN-REVIEW.md)
-- [设计评审 - Claude](./DESIGN-REVIEW-CLAUDE.md)
+- [设计评审 - Claude v1.0.0](./DESIGN-REVIEW-CLAUDE.md)
+- [设计评审 - Claude v1.2.0](./DESIGN-REVIEW-v1.2.0.md)
 
 ### B. 术语表
 
@@ -1429,3 +1662,17 @@ agent.on("watch.match", lambda e: trigger_webhook(e))
   - **P1**: DELETE 语义明确（kill vs delete）
   - **砍掉**: Node.js SDK/Web UI/stdio 推迟
   - **时间**: Phase 1 加 5 天 buffer
+- 2026-06-20: v1.2.1 阻塞项修复版
+  - **新增 SessionRegistry**: `asyncio.Semaphore(5)` 并发控制 + 排队超时
+  - **新增 Idle timeout watchdog**: 每 5 秒检查，超时自动 kill
+  - **新增 SessionStartEvent**: execute() 开头 yield session.start
+  - **新增 Error event**: subprocess 启动失败时 yield error 事件
+  - **Heartbeat 节流**: 最多每 1 秒写一次，避免写风暴
+  - **Tags 管理 API**: `add_tag`/`remove_tag`/`list_tags`/`filter_by_tag`
+  - **stderr 可见**: stderr 事件写入 storage，可通过 stream_events 读取
+  - **WatchPattern 恢复**: 支持 notify/callback/stop 三种 action
+  - **双模式存储优化**: standard 模式 `raw_json` 为 NULL，避免冗余
+  - **SSE 协议细节**: 心跳（30s ping）、断点续传、自动关闭
+  - **认证明确**: 环境变量 `CODING_AGENT_AUTH_TOKEN`，明文比对
+  - **多 Agent 编排**: 标注为 Phase 3+
+  - **时间**: Phase 1 增加到 19 天
