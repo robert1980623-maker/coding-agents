@@ -167,6 +167,9 @@ class StreamExecutor:
         # Idle-timeout watchdog
         watchdog_task = asyncio.create_task(self._idle_watchdog(session_id))
 
+        # Heartbeat checker: polls DB for kill/failed signals
+        heartbeat_task = asyncio.create_task(self._heartbeat_checker(session_id))
+
         # stdout reader task
         async def stdout_reader() -> None:
             try:
@@ -210,6 +213,12 @@ class StreamExecutor:
             watchdog_task.cancel()
             try:
                 await watchdog_task
+            except asyncio.CancelledError:
+                pass
+
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
             except asyncio.CancelledError:
                 pass
 
@@ -306,6 +315,46 @@ class StreamExecutor:
         except asyncio.CancelledError:
             raise
 
+    async def _heartbeat_checker(self, session_id: str) -> None:
+        """Poll DB for kill/failed signals and terminate subprocess if detected.
+
+        Checks every 2 seconds. When a terminal status (KILLED, FAILED) is
+        observed, sends SIGTERM, waits up to 5s for graceful shutdown, then
+        SIGKILL if needed.
+        """
+        try:
+            while True:
+                await asyncio.sleep(2)
+                session = await self.store.get_session(session_id)
+                if session is None:
+                    return
+                if session.status in {SessionStatus.KILLED, SessionStatus.FAILED}:
+                    if self._process is not None and self._process.returncode is None:
+                        logger.info(
+                            "heartbeat_kill_signal",
+                            session_id=session_id,
+                            status=session.status.value,
+                        )
+                        await self._terminate_process()
+                    return
+        except asyncio.CancelledError:
+            raise
+
+    async def _terminate_process(self) -> None:
+        """Gracefully terminate the subprocess: SIGTERM, wait 5s, then SIGKILL."""
+        if self._process is None or self._process.returncode is not None:
+            return
+        self._process.terminate()
+        try:
+            await asyncio.wait_for(self._process.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            if self._process.returncode is None:
+                logger.warning(
+                    "graceful_timeout_force_kill",
+                    pid=self._process.pid,
+                )
+                self._process.kill()
+
     def _extract_text(self, line: str, output_mode: str) -> str:
         """Extract text content for standard mode; pass-through otherwise."""
         if output_mode == "passthrough":
@@ -363,9 +412,4 @@ class StreamExecutor:
 
     async def kill(self) -> None:
         """Terminate the running subprocess."""
-        if self._process is not None and self._process.returncode is None:
-            self._process.terminate()
-            try:
-                await asyncio.wait_for(self._process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                self._process.kill()
+        await self._terminate_process()
