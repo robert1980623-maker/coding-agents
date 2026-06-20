@@ -210,3 +210,21 @@ def test_cli_skill_help():
     for cmd in ["install", "list", "show", "remove"]:
         assert cmd in skill_click.commands, f"Missing skill command: {cmd}"
 
+
+
+# === project-local skill discovery ===
+
+def test_project_local_skill_is_discoverable(tmp_path, monkeypatch):
+    """A SKILL.md under <cwd>/.coding-agents/skills/<name>/ must be found
+    by `coding-agents skill list` (and load_all_skills()).
+    """
+    skill_dir = tmp_path / ".coding-agents" / "skills" / "demo-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(VALID_SKILL_MD)
+    
+    monkeypatch.chdir(tmp_path)
+    
+    from coding_agents.skills.loader import load_all_skills
+    skills = load_all_skills()
+    names = [s.name for s in skills]
+    assert "test-skill" in names  # VALID_SKILL_MD's name
