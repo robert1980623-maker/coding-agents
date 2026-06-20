@@ -74,8 +74,20 @@ def _get_storage() -> SQLiteStorage:
 
 
 def _run_async(coro: Any) -> Any:
-    """Run an async function in a sync CLI context."""
-    return asyncio.run(coro)
+    """Run an async function in a sync CLI context.
+
+    v0.2.12: asyncio.run() does not propagate BaseException like
+    SystemExit to the outer code — it logs "Task exception was never
+    retrieved" and returns normally. We catch SystemExit here and
+    re-raise so the process exits with the correct POSIX code
+    (128 + signal).
+    """
+    try:
+        return asyncio.run(coro)
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        raise SystemExit(130)
 
 
 @app.command()
@@ -215,6 +227,10 @@ async def _run_session(
         _received_signal["signal"] = signum
         # SystemExit is a BaseException that triggers finally blocks.
         # The exit code follows the POSIX convention: 128 + signum.
+        # Note: with start_new_session=True (v0.2.12), the wrapper's
+        # SIGTERM is not propagated to the subprocess; the catch block
+        # below calls executor._terminate_process() to kill the
+        # process group and unblock the async for stdout pipe.
         raise SystemExit(128 + signum)
 
     loop = asyncio.get_running_loop()
@@ -230,8 +246,10 @@ async def _run_session(
 
         Called from the finally block. Idempotent: if the executor loop
         finished normally (status already COMPLETED / FAILED / KILLED)
-        this is a no-op. If a signal or unrecoverable exception killed
-        the loop mid-stream we mark it FAILED with signal/error metadata.
+        this is a no-op unless ``sig`` is set, in which case we enrich
+        the metadata with signal info. If a signal or unrecoverable
+        exception killed the loop mid-stream we mark it FAILED with
+        signal/error metadata.
         """
         try:
             current = await storage.get_session(session.id)
@@ -240,6 +258,27 @@ async def _run_session(
         if current is None:
             return
         if current.status != SessionStatus.RUNNING:
+            # v0.2.12: enrich metadata with signal info even if executor
+            # already finalized the session (it terminates the subprocess
+            # and records exit_code=-15, but not the wrapper's signal).
+            if sig is not None:
+                merged = dict(current.metadata or {})
+                merged["signal"] = sig
+                try:
+                    merged["signal_name"] = signal.Signals(sig).name
+                except (ValueError, AttributeError):
+                    pass
+                merged["error"] = "wrapper terminated"
+                try:
+                    await storage.update_session(
+                        session.id,
+                        metadata=merged,
+                        # Normalize: signal-terminated sessions are
+                        # conventionally exit_code=-1 in our schema.
+                        exit_code=-1,
+                    )
+                except Exception:
+                    pass
             return
 
         metadata: dict[str, Any] = {"error": "wrapper terminated"}
@@ -284,11 +323,23 @@ async def _run_session(
                     exit_code = data.get("exit_code")
                 elif event.type == EventType.ERROR:
                     error_text = event.data
-        except SystemExit:
-            # Signal handler raised this. Don't log as generic error;
-            # the finally block will finalize the session with signal info.
+        except asyncio.CancelledError:
+            # v0.2.12: When asyncio's signal handler raises SystemExit,
+            # the running coroutine receives CancelledError instead.
+            # We translate it back to SystemExit so the finally block
+            # can finalize the session with the signal metadata.
+            if _received_signal["signal"] is not None:
+                await executor._terminate_process()
+                raise SystemExit(128 + _received_signal["signal"])
             raise
-        except Exception as e:
+        # v0.2.12: If CancelledError was swallowed inside the executor's
+        # async generator, the loop exits normally but the signal handler
+        # already ran. Surface it as SystemExit so the outer finally
+        # records the signal in session metadata.
+        if _received_signal["signal"] is not None and exit_code is None:
+            error_text = error_text or "wrapper terminated"
+            raise SystemExit(128 + _received_signal["signal"])
+    except Exception as e:
             console.print(f"[red]Execution error: {e}[/red]")
             error_text = str(e)
             # Finalize now (status -> FAILED). The finally block will see
@@ -459,7 +510,7 @@ async def _list_sessions(
             console.print("[dim]No sessions found.[/dim]")
             return
         table = Table(title="Sessions")
-        table.add_column("ID", style="cyan", no_wrap=True)
+        table.add_column("ID", style="cyan", overflow="fold")
         table.add_column("Agent", style="magenta")
         table.add_column("Status", style="green")
         table.add_column("Started")
@@ -471,7 +522,7 @@ async def _list_sessions(
             dur = str(s.duration_ms) if s.duration_ms is not None else "-"
             prompt_short = s.prompt[:60] + "..." if len(s.prompt) > 60 else s.prompt
             table.add_row(
-                s.id[:8],
+                s.id,
                 s.agent.value,
                 s.status.value,
                 started,
@@ -503,7 +554,7 @@ async def _search_events(query: str, agent: Optional[str], limit: int) -> None:
             return
         for ev in events:
             console.print(
-                f"[cyan]{ev.session_id[:8]}[/cyan] [{ev.channel}] {ev.data.strip()}"
+                f"[cyan]{ev.session_id}[/cyan] [{ev.channel}] {ev.data.strip()}"
             )
     finally:
         await storage.close()

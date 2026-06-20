@@ -303,3 +303,39 @@ class TestFlush:
         # Should be a no-op
         await executor._flush()
         assert executor._buffer == []
+
+
+class TestSubprocessProcessGroup:
+    """v0.2.12: subprocess must run in its own process group so wrapper
+    SIGTERM/SIGKILL doesn't propagate to it."""
+
+    async def test_subprocess_runs_in_new_session(
+        self, storage: SQLiteStorage, tmp_path: Path
+    ):
+        """The spawned subprocess should have a different session ID
+        (process group) from the wrapper."""
+        import os
+        config = ExecutionConfig()
+        executor = StreamExecutor(store=storage, config=config)
+
+        session = Session(agent="claude", prompt="test", workdir=str(tmp_path))
+        await storage.create_session(session)
+
+        # Command that prints its own session ID as JSON
+        command = [
+            sys.executable, "-c",
+            "import os, json; print(json.dumps({'sid': os.getsid(0)}))",
+        ]
+
+        wrapper_sid = os.getsid(os.getpid())
+        child_sid = None
+        import json as _json
+        async for event in executor.execute(session.id, command, str(tmp_path)):
+            if event.type == EventType.STDOUT:
+                child_sid = _json.loads(event.data.strip())["sid"]
+
+        assert child_sid is not None, "subprocess didn't print its session ID"
+        assert child_sid != wrapper_sid, (
+            f"subprocess should be in a new session "
+            f"(wrapper sid={wrapper_sid}, child sid={child_sid})"
+        )

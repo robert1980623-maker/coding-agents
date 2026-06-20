@@ -112,6 +112,7 @@ class StreamExecutor:
                 stderr=asyncio.subprocess.PIPE,
                 limit=self.config.line_limit,
                 env=merged_env,
+                start_new_session=True,  # v0.2.12: detach subprocess to its own process group
             )
         except Exception as e:
             # Emit error event
@@ -233,6 +234,15 @@ class StreamExecutor:
             except asyncio.CancelledError:
                 pass
 
+            # Terminate the subprocess first to unblock stdout/stderr readers
+            if self._process is not None and self._process.returncode is None:
+                self._process.terminate()
+                try:
+                    await asyncio.wait_for(self._process.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    if self._process.returncode is None:
+                        self._process.kill()
+
             try:
                 await stdout_task
             except asyncio.CancelledError:
@@ -243,7 +253,7 @@ class StreamExecutor:
             except asyncio.CancelledError:
                 pass
 
-            # Wait for process to finish
+            # Wait for process to finish (should already be done)
             if self._process is not None:
                 exit_code = await self._process.wait()
             else:
@@ -378,19 +388,62 @@ class StreamExecutor:
             raise
 
     async def _terminate_process(self) -> None:
-        """Gracefully terminate the subprocess: SIGTERM, wait 5s, then SIGKILL."""
+        """Gracefully terminate the subprocess: SIGTERM, wait 5s, then SIGKILL.
+
+        v0.2.12: When ``start_new_session=True`` is set, the subprocess
+        is in its own process group, so ``terminate()`` (which sends
+        SIGTERM to the process only) is propagated. We also send SIGTERM
+        to the process group to catch any grandchildren, then SIGKILL
+        the group if the process doesn't exit in time.
+        """
         if self._process is None or self._process.returncode is not None:
             return
-        self._process.terminate()
+        import os
+        import signal as _sig
+        pid = self._process.pid
+        # Send SIGTERM to the whole process group (catches grandchildren).
+        try:
+            os.killpg(os.getpgid(pid), _sig.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
         try:
             await asyncio.wait_for(self._process.wait(), timeout=5.0)
         except asyncio.TimeoutError:
-            if self._process.returncode is None:
-                logger.warning(
-                    "graceful_timeout_force_kill",
-                    pid=self._process.pid,
-                )
-                self._process.kill()
+            if self._process.returncode is not None:
+                return
+            logger.warning(
+                "graceful_timeout_force_kill",
+                pid=pid,
+            )
+            try:
+                os.killpg(os.getpgid(pid), _sig.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    async def force_terminate_process_group(self) -> None:
+        """v0.2.12: Force-kill the subprocess's process group.
+
+        When ``start_new_session=True`` is set, the subprocess is detached
+        from the wrapper's process group, so the wrapper's SIGTERM is not
+        propagated. This method sends SIGTERM to the entire process group
+        and falls back to SIGKILL if it doesn't exit in time.
+        """
+        if self._process is None or self._process.returncode is not None:
+            return
+        import os
+        import signal as _sig
+        pid = self._process.pid
+        try:
+            os.killpg(os.getpgid(pid), _sig.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            await asyncio.wait_for(self._process.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            try:
+                os.killpg(os.getpgid(pid), _sig.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
 
     def _extract_text(self, line: str, output_mode: str) -> str:
         """Extract text content for standard mode; pass-through otherwise."""
