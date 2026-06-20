@@ -112,7 +112,7 @@ class StreamExecutor:
                 stderr=asyncio.subprocess.PIPE,
                 limit=self.config.line_limit,
                 env=merged_env,
-                start_new_session=True,  # v0.2.13: detach subprocess to its own process group
+                start_new_session=True,  # v0.2.14: detach subprocess to its own process group
             )
         except Exception as e:
             # Emit error event
@@ -234,7 +234,7 @@ class StreamExecutor:
             except asyncio.CancelledError:
                 pass
 
-            # v0.2.13: With start_new_session=True, the subprocess is in
+            # v0.2.14: With start_new_session=True, the subprocess is in
             # its own process group and detached from the wrapper. If the
             # executor is being cancelled (e.g. wrapper got SIGTERM), we
             # must NOT terminate the subprocess - it should keep running
@@ -279,7 +279,7 @@ class StreamExecutor:
                     status=current_session.status.value,
                 )
             else:
-                # v0.2.13: When the wrapper detached (exited while the
+                # v0.2.14: When the wrapper detached (exited while the
                 # subprocess is still running in its own process group),
                 # exit_code will be -1 from the 0.5s wait timeout. Record
                 # the subprocess PID in metadata so users can `tail` the
@@ -416,7 +416,7 @@ class StreamExecutor:
     async def _terminate_process(self) -> None:
         """Gracefully terminate the subprocess: SIGTERM, wait 5s, then SIGKILL.
 
-        v0.2.13: When ``start_new_session=True`` is set, the subprocess
+        v0.2.14: When ``start_new_session=True`` is set, the subprocess
         is in its own process group, so ``terminate()`` (which sends
         SIGTERM to the process only) is propagated. We also send SIGTERM
         to the process group to catch any grandchildren, then SIGKILL
@@ -447,7 +447,7 @@ class StreamExecutor:
                 pass
 
     async def force_terminate_process_group(self) -> None:
-        """v0.2.13: Force-kill the subprocess's process group.
+        """v0.2.14: Force-kill the subprocess's process group.
 
         When ``start_new_session=True`` is set, the subprocess is detached
         from the wrapper's process group, so the wrapper's SIGTERM is not
@@ -528,7 +528,21 @@ class StreamExecutor:
             if wp.pattern in event.data:
                 if wp.action == "stop":
                     if self._process is not None and self._process.returncode is None:
-                        self._process.terminate()
+                        # v0.2.14: with start_new_session=True the subprocess
+                        # is in its own process group. ``terminate()`` only
+                        # sends SIGTERM to the process itself; use killpg
+                        # to also catch grandchildren and ensure the
+                        # process group actually exits so the readers
+                        # see EOF and the executor's stream can finish.
+                        import os as _os
+                        import signal as _sig
+                        try:
+                            _os.killpg(
+                                _os.getpgid(self._process.pid),
+                                _sig.SIGTERM,
+                            )
+                        except (ProcessLookupError, PermissionError, OSError):
+                            pass
                 elif wp.action == "notify":
                     # Notify placeholder — future: callback dispatch
                     pass

@@ -211,33 +211,83 @@ class TestStreamExecutorWatchdog:
 
 class TestStreamExecutorWatchPattern:
     async def test_watch_stop(self, storage: SQLiteStorage, tmp_path: Path):
-        """Watch pattern with action='stop' terminates the process."""
-        config = ExecutionConfig(
-            watch_patterns=[
-                {"pattern": "STOP_NOW", "action": "stop"}
-            ]
-        )
-        # Use ExecutionConfig but need proper WatchPattern
+        """Watch pattern with action='stop' terminates the process.
+
+        The subprocess prints 'hello' then 'STOP_NOW' then sleeps for a
+        long time. The watch pattern fires on 'STOP_NOW' and calls
+        ``executor._process.terminate()`` to kill the process group.
+
+        Without an outer ``wait_for`` guard, the test's ``async for`` would
+        wait forever for the executor to finish (subprocess sleep blocks
+        the stdout reader). The 5-second guard ensures a regression that
+        doesn't actually stop the process is caught quickly with a clear
+        error instead of a 30-second hang.
+        """
         from coding_agents.models import WatchPattern
-        config.watch_patterns = [WatchPattern(pattern="STOP_NOW", action="stop")]
+        config = ExecutionConfig(
+            watch_patterns=[WatchPattern(pattern="STOP_NOW", action="stop")],
+        )
         executor = StreamExecutor(store=storage, config=config)
 
         session = Session(agent="claude", prompt="test", workdir=str(tmp_path))
         await storage.create_session(session)
 
         command = [
-            sys.executable, "-c",
-            "print('hello'); print('STOP_NOW'); import time; time.sleep(30)"
+            sys.executable, "-u", "-c",
+            "print('hello'); print('STOP_NOW'); import time; time.sleep(30)",
         ]
 
-        events = []
-        async for event in executor.execute(session.id, command, str(tmp_path)):
-            events.append(event)
+        events: list[Event] = []
+
+        async def _collect_all() -> list[Event]:
+            # v0.2.14: collect ALL events until the executor's stream
+            # terminates. The stream ends when the readers see EOF on
+            # the subprocess's stdout/stderr pipes (which happens when
+            # the watch stop action kills the subprocess). The result
+            # event is yielded last.
+            async for event in executor.execute(session.id, command, str(tmp_path)):
+                events.append(event)
+            return events
+
+        # Hard timeout: if watch stop doesn't actually terminate the
+        # subprocess, the test fails fast instead of waiting 30s.
+        try:
+            events = await asyncio.wait_for(_collect_all(), timeout=5.0)
+        except asyncio.TimeoutError:
+            # Defensive cleanup so the test process doesn't leak the
+            # detached subprocess (v0.2.14 leaves it running).
+            if executor._process is not None and executor._process.returncode is None:
+                try:
+                    import signal as _sig
+                    import os as _os
+                    _os.killpg(_os.getpgid(executor._process.pid), _sig.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            pytest.fail(
+                "executor.execute() did not exit within 5s after watch "
+                "pattern fired. watch stop action is not terminating the "
+                "subprocess."
+            )
+
+        # Sanity: we received the result event (terminal).
+        result_events = [e for e in events if e.type == EventType.RESULT]
+        assert len(result_events) == 1, (
+            f"expected exactly one RESULT event, got {len(result_events)}: "
+            f"{[e.type.value for e in events]}"
+        )
 
         loaded = await storage.get_session(session.id)
         assert loaded is not None
-        # Process should be terminated (exit_code might be -15 for SIGTERM)
-        assert loaded.status in {SessionStatus.COMPLETED, SessionStatus.FAILED, SessionStatus.KILLED}
+        # The watch pattern fired terminate() on the process group, so
+        # the subprocess is killed and the executor finalizes the session
+        # as FAILED with exit_code=-15 (killed by SIGTERM).
+        assert loaded.status in {SessionStatus.COMPLETED, SessionStatus.FAILED}, (
+            f"expected terminal status, got {loaded.status.value}"
+        )
+        assert loaded.exit_code is not None
+        assert loaded.exit_code < 0, (
+            f"expected negative exit code (killed by signal), got {loaded.exit_code}"
+        )
 
 
 class TestExtractText:
@@ -306,7 +356,7 @@ class TestFlush:
 
 
 class TestSubprocessProcessGroup:
-    """v0.2.13: subprocess must run in its own process group so wrapper
+    """v0.2.14: subprocess must run in its own process group so wrapper
     SIGTERM/SIGKILL doesn't propagate to it."""
 
     async def test_subprocess_runs_in_new_session(
@@ -342,7 +392,7 @@ class TestSubprocessProcessGroup:
 
 
 def test_subprocess_detached_process_group(tmp_path: Path):
-    """v0.2.13: When the wrapper receives SIGTERM, the spawned subprocess
+    """v0.2.14: When the wrapper receives SIGTERM, the spawned subprocess
     must CONTINUE running (because start_new_session=True detaches it into
     its own process group), and the session must be marked FAILED.
 
@@ -441,7 +491,7 @@ with patch("coding_agents.cli.get_agent", return_value=FakeAdapter()):
             f"sent SIGTERM to the wrapper"
         )
 
-        # v0.2.13 invariant: child is in a different process group
+        # v0.2.14 invariant: child is in a different process group
         # from the wrapper, so wrapper SIGTERM does not propagate.
         assert child_pgid != os.getpgid(0), (
             f"subprocess is in the same process group as the test "
@@ -451,7 +501,7 @@ with patch("coding_agents.cli.get_agent", return_value=FakeAdapter()):
         # Send SIGTERM to the wrapper.
         proc.send_signal(signal.SIGTERM)
 
-        # Wait for the wrapper to exit. v0.2.13's signal handler
+        # Wait for the wrapper to exit. v0.2.14's signal handler
         # converts SIGTERM into SystemExit, the executor's finally
         # block uses a 0.5s wait timeout for the detached subprocess,
         # the dispatch finally block finalizes the session as FAILED.
@@ -462,7 +512,7 @@ with patch("coding_agents.cli.get_agent", return_value=FakeAdapter()):
             proc.wait()
             pytest.fail(
                 "wrapper did not exit within 10s after SIGTERM. "
-                "v0.2.13's executor should not block on the detached subprocess."
+                "v0.2.14's executor should not block on the detached subprocess."
             )
 
         # POSIX exit code: 128 + SIGTERM(15) = 143
@@ -480,13 +530,13 @@ with patch("coding_agents.cli.get_agent", return_value=FakeAdapter()):
             child_alive_after = False
         assert child_alive_after, (
             f"subprocess pid={child_pid} was killed when the wrapper "
-            f"died -- v0.2.13's start_new_session=True should have "
+            f"died -- v0.2.14's start_new_session=True should have "
             f"detached it into its own process group. This is a "
             f"regression of the active-detach design."
         )
 
         # The session must be marked FAILED (v0.2.11 signal handler
-        # contract that v0.2.13 inherits and extends).
+        # contract that v0.2.14 inherits and extends).
         async def _check_session():
             store = SQLiteStorage(str(db_path))
             await store.initialize()

@@ -45,7 +45,19 @@ class TestMemoryBaseline:
         """Verify memory usage stays under 50MB during 5min execution.
 
         Design target: < 50MB for sustained output streaming.
+
+        Note: ``process_monitor`` reads RSS of the current process (the
+        pytest parent), not the spawned subprocess. When this test runs
+        in a full ``pytest tests/`` invocation, the parent has already
+        imported every module and run every prior test, so the absolute
+        RSS at sample time is the parent baseline + this test's delta.
+        We measure the *delta* (peak minus baseline) so the test is
+        independent of test-run order.
         """
+        # Take the baseline before any test work happens.
+        process_monitor.sample()
+        baseline_mb = process_monitor.peak_memory_mb
+
         storage = SQLiteStorage(tmp_path / "bench.db")
         await storage.initialize()
 
@@ -64,9 +76,6 @@ class TestMemoryBaseline:
         )
         session_id = await storage.create_session(session)
 
-        # Start monitoring
-        process_monitor.sample()
-
         event_count = 0
         start_time = time.time()
 
@@ -82,11 +91,19 @@ class TestMemoryBaseline:
                 break
 
         peak_memory = process_monitor.peak_memory_mb
+        delta_mb = peak_memory - baseline_mb
 
-        # Design target: < 50MB
-        assert peak_memory < 50, f"Peak memory {peak_memory:.2f}MB exceeds 50MB target"
+        # Design target: < 50MB delta from this test's own execution.
+        # The absolute RSS depends on pytest's total memory which is
+        # outside this test's control.
+        assert delta_mb < 50, (
+            f"Memory delta {delta_mb:.2f}MB (baseline {baseline_mb:.2f}MB, "
+            f"peak {peak_memory:.2f}MB) exceeds 50MB target"
+        )
 
-        print(f"\n[benchmark] Peak memory: {peak_memory:.2f}MB")
+        print(f"\n[benchmark] Baseline RSS: {baseline_mb:.2f}MB")
+        print(f"[benchmark] Peak RSS: {peak_memory:.2f}MB")
+        print(f"[benchmark] Delta: {delta_mb:.2f}MB")
         print(f"[benchmark] Events processed: {event_count}")
 
         await storage.close()

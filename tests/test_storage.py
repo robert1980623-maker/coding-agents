@@ -211,17 +211,65 @@ class TestEvents:
         await storage.append_events([])
 
     async def test_stream_events(self, storage: SQLiteStorage, sample_session: Session):
+        """stream_events should yield all past events then exit when the
+        session reaches a terminal status. Without marking the session
+        terminal, the streamer would block forever (long-poll design).
+        """
         await storage.create_session(sample_session)
         events = [
             Event(session_id=sample_session.id, channel="stdout", seq=i, type=EventType.STDOUT, data=f"line{i}")
             for i in range(1, 4)
         ]
         await storage.append_events(events)
+        # Mark the session terminal so the long-poll loop exits.
+        await storage.update_session(
+            sample_session.id, status=SessionStatus.COMPLETED,
+        )
 
         collected = []
         async for e in storage.stream_events(sample_session.id):
             collected.append(e)
         assert len(collected) == 3
+
+    async def test_stream_events_yields_only_new_events_with_after_seq(
+        self, storage: SQLiteStorage, sample_session: Session,
+    ):
+        """stream_events(after_seq=N) must skip events with seq <= N
+        and only yield seq > N. Combined with a terminal status, the
+        long-poll loop exits after the first poll.
+        """
+        await storage.create_session(sample_session)
+        events = [
+            Event(session_id=sample_session.id, channel="stdout", seq=i, type=EventType.STDOUT, data=f"line{i}")
+            for i in range(1, 6)
+        ]
+        await storage.append_events(events)
+        await storage.update_session(
+            sample_session.id, status=SessionStatus.COMPLETED,
+        )
+
+        collected = []
+        async for e in storage.stream_events(sample_session.id, after_seq=2):
+            collected.append(e)
+        assert len(collected) == 3
+        assert [e.seq for e in collected] == [3, 4, 5]
+
+    async def test_stream_events_empty_session_returns_immediately(
+        self, storage: SQLiteStorage, sample_session: Session,
+    ):
+        """stream_events on a terminal session with no events must return
+        without blocking. Long-poll's worst-case behavior would hang.
+        """
+        await storage.create_session(sample_session)
+        await storage.update_session(
+            sample_session.id, status=SessionStatus.COMPLETED,
+        )
+        # Use a hard timeout so a regression that re-enters the long-poll
+        # loop fails with a clear error, not a 30-minute hang.
+        async def _collect() -> list[Event]:
+            return [e async for e in storage.stream_events(sample_session.id)]
+        collected = await asyncio.wait_for(_collect(), timeout=5.0)
+        assert collected == []
 
 
 class TestFTS:
