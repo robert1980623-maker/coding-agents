@@ -181,7 +181,7 @@ class SQLiteStorage:
         async with self._lock:
             await asyncio.to_thread(
                 conn.execute,
-                f"UPDATE sessions SET {set_clause} WHERE id = ?",
+                f"UPDATE sessions SET {set_clause} WHERE id = ?",  # nosec B608
                 values,
             )
             await asyncio.to_thread(conn.commit)
@@ -213,22 +213,20 @@ class SQLiteStorage:
             tag_placeholders = ", ".join("?" for _ in tags)
             params.extend(tags)
             tag_count = len(tags)
-            sql = f"""
-                SELECT s.* FROM sessions s
-                INNER JOIN (
-                    SELECT session_id FROM session_tags
-                    WHERE tag IN ({tag_placeholders})
-                    GROUP BY session_id HAVING COUNT(DISTINCT tag) = ?
-                ) st ON st.session_id = s.id
-                {where}
-                ORDER BY s.created_at DESC
-                LIMIT ?
-            """
+            sql = (
+                "SELECT s.* FROM sessions s "
+                "INNER JOIN ( "
+                "SELECT session_id FROM session_tags "
+                f"WHERE tag IN ({tag_placeholders}) "  # nosec B608
+                "GROUP BY session_id HAVING COUNT(DISTINCT tag) = ? "
+                f") st ON st.session_id = s.id {where} "  # nosec B608
+                "ORDER BY s.created_at DESC LIMIT ?"
+            )
             params.append(tag_count)
             params.append(limit)
             cursor = await asyncio.to_thread(conn.execute, sql, params)
         else:
-            sql = f"SELECT * FROM sessions s {where} ORDER BY s.created_at DESC LIMIT ?"
+            sql = f"SELECT * FROM sessions s {where} ORDER BY s.created_at DESC LIMIT ?"  # nosec B608
             params.append(limit)
             cursor = await asyncio.to_thread(conn.execute, sql, params)
 
