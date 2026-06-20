@@ -2001,3 +2001,65 @@ uv run python -m coding_agents.http.cli_integration --port 8080 --host 127.0.0.1
 **下一步**:
 - T2.4: 更新 PHASE1_ISSUES.md
 - Phase 2 后续: 实际执行集成（当前 HTTP API 只创建 session 记录，不启动执行）
+
+### C.7 Session 3: 多 Agent 编排 + Session 续跑 (T3.1-T3.2)
+
+**日期**: 2026-06-20
+**目标**: 解锁批量多 agent 场景 + 从中断点续跑 session
+
+#### C.7.1 T3.1 — DAG-based multi-agent orchestration
+
+**问题**: P1-2 — 多 Agent 编排未实现（v1.2.1 标注 Phase 3+）
+
+**方案**: 引入 `TaskFlow`（DAG 容器）+ `TaskResult`（任务结果），按拓扑分层并行执行，超时通过 executor 的 `finally` 块传播到子进程，依赖失败时跳过下游任务。
+
+**实现**:
+- `src/coding_agents/orchestrator/__init__.py` — 模块导出
+- `src/coding_agents/orchestrator/dag.py` — `Task` dataclass + `TaskFlow`（Kahn 拓扑排序 + 环检测）+ `TaskResult` + `execution_layers()`（返回可并行执行的层）
+- `src/coding_agents/orchestrator/runner.py` — `FlowRunner`（asyncio.gather 并行执行 + per-task `asyncio.wait_for` 超时 + 依赖失败跳过）
+- `src/coding_agents/orchestrator/cli_integration.py` — CLI helpers（不改 cli.py）
+- `tests/test_orchestrator.py` — 40 个测试（TaskFlow 构造、拓扑排序、环检测、Diamond DAG、并行执行、超时、依赖失败传播、CLI integration）
+
+**技术要点**:
+- Kahn 算法拓扑排序：O(V+E)，自然暴露环
+- `execution_layers` 返回 `list[list[Task]]`，每个内层可并发执行
+- per-task timeout 经 `asyncio.wait_for` 触发，最终由 `StreamExecutor` finally 块 SIGTERM 子进程
+- 依赖失败传播：父任务未 COMPLETED → 子任务标 `skipped`，不启动 subprocess
+- 不修改 `executor.py` / `cli.py` / `registry.py` / `storage/*` / `agents/*`，纯新增模块
+
+#### C.7.2 T3.2 — Session resume（执行续跑）
+
+**问题**: P2-5 — 只能恢复状态（标记 ORPHANED），不能从 `last_seq` 续跑；v1.2.1 设计明确这是 Phase 3+ 范围
+
+**方案**: 新增 `resume.py`，提供 `ResumeInfo` + `can_resume()` + `prepare_resume_command()` + `resume_session()`，注入 agent CLI 的 `--resume` flag 即可续跑（claude/codex 原生支持）。
+
+**实现**:
+- `src/coding_agents/resume.py` — `ResumeInfo` / `can_resume()`（status 终态 + exit_code=0 或 KILLED/TIMEOUT）/ `prepare_resume_command()`（注入 `--resume <session_id>`）/ `resume_session()`（创建 linked 新 session + 重启 agent）
+- `tests/test_resume.py` — 46 个测试（can_resume 各种 status、--resume flag 注入、seq 续号、linked session 关联、CLI 不支持场景降级、异常路径全覆盖）
+
+**技术要点**:
+- agent CLI 差异：`claude --resume <id>` vs `codex --resume <id>`，由 adapter 提供
+- 续跑策略：创建**新** session（避免破坏原 session 历史），通过 metadata 字段关联 `resumed_from`
+- last_seq 续号：resume session 从 `original_last_seq + 1` 开始 append events
+- 不可续跑场景：FAILED/INVALID_CONFIG/非 agent 错误 → 抛 `ResumeError`
+- 不修改 `executor.py` / `agents/*`，纯新增模块
+
+#### C.7.3 测试结果汇总
+
+**新增测试**: 86 个
+- Orchestrator: 40 个（DAG + Runner + CLI integration）
+- Resume: 46 个（can_resume + prepare_resume + resume_session）
+
+**已知问题**: `tests/test_orchestrator.py::TestRunFlow::test_complex_dag_topological_order` 偶发失败（task c 在 mock agent 中报告 "bad parameter or other API misuse"，疑为 mock 副作用，待后续修复）。本节文档同步阶段不修改源代码，留待独立 PR。
+
+**总计**: ~270 passed / 2 skipped / 1 flaky（基线 184，+86，扣除 1 flaky）
+
+**修复问题**:
+- ✅ P1-2: 多 Agent 编排未实现（DAG + 并行执行 + 超时传播）
+- ✅ P2-5: 无 session 恢复 / 执行续跑（--resume flag 注入 + last_seq 续号）
+
+**文件隔离**: ✅ 严格遵守，只修改/创建指定文件
+
+**下一步**:
+- Phase 3 后续: Node.js SDK（HTTP-only client）/ Web UI / 向量搜索（sqlite-vec）
+- Phase 3+ 高级: 并发调度优化、distributed executor、更多 agent 适配

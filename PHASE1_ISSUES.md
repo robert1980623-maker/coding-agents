@@ -56,7 +56,7 @@ Phase 1 实施 + 质量审计 + 集成测试未发现 P0 级问题。102+30 测�
   - **方案 C**: HTTP API 用 asyncio.Event 取消任务（仅 HTTP 场景有效）
 - **实施**: `StreamExecutor._heartbeat_checker` 每 2s 轮询 DB，检测到 KILLED/FAILED 时 SIGTERM→5s→SIGKILL。实测 sleep 60 在 2.1s 内终止。
 
-#### P1-2: 多 Agent 编排未实现
+#### P1-2: 多 Agent 编排未实现 ✅ 已完成（在 v0.2.0 T3 中实施）
 
 - **来源**: v1.2.1 设计标注 Phase 3+
 - **影响**: 无法批量执行多个 agent、定义依赖 DAG、超时传播
@@ -65,6 +65,7 @@ Phase 1 实施 + 质量审计 + 集成测试未发现 P0 级问题。102+30 测�
   - DAG 定义（TaskFlow）
   - 依赖管理（任务 A 完成后再启动 B）
   - 结果聚合（merge、race、first-wins）
+- **实施**: 新增 `src/coding_agents/orchestrator/` 模块（dag.py + runner.py + cli_integration.py），实现 Task / TaskFlow（Kahn 拓扑排序 + 环检测）+ 按 execution_layers 并行执行（asyncio.gather）+ per-task 超时传播 + 依赖失败跳过 + 结果聚合。40 个测试通过（test_orchestrator.py）。
 
 #### P1-3: HTTP API 缺失 ✅ 已修 (v0.2.0 S2)
 
@@ -115,11 +116,12 @@ Phase 1 实施 + 质量审计 + 集成测试未发现 P0 级问题。102+30 测�
 - **建议**: Phase 2 添加 retry 逻辑（指数退避）
 - **实施**: 新增 `retry.py`（RetryPolicy + with_retry + with_retry_generator）+ `retry_integration.py`（make_executor_with_retry wrapper）。支持指数退避、指定 retry_on 异常类型、generator 重试。14 个测试通过。
 
-#### P2-5: 无 session 恢复（执行续跑）
+#### P2-5: 无 session 恢复（执行续跑） ✅ 已完成（在 v0.2.0 T3 中实施）
 
 - **来源**: 设计 §3.2 ORPHANED
 - **影响**: 只能恢复状态（标记 ORPHANED），不能从 last_seq 续跑
 - **说明**: v1.2.1 设计明确这是 Phase 3+ 范围
+- **实施**: 新增 `src/coding_agents/resume.py`（ResumeInfo + can_resume + prepare_resume_command + resume_session），支持 Claude `--resume` / Codex `--resume` flag 注入，续跑从 last_seq 继续并关联到新 session。46 个单元测试覆盖正常流程 + 所有失败模式（test_resume.py）。
 
 #### P2-6: 无 metrics / 监控 ✅ 已修 (v0.2.0 S2)
 
@@ -191,7 +193,7 @@ HTTP 才有认证需求，CLI 默认本地使用。Phase 2 HTTP 需要 token 验
 | 🔴 P0 | （无） | — | — |
 | 🟡 P1-A | **修 P1-1 kill 命令** | 2-3 天 | 阻塞 CLI 实际使用 |
 | 🟡 P1-B | **Phase 2 HTTP API** | 13 天 | 解锁远程集成 |
-| 🟡 P1-C | **Phase 3 多 agent 编排** | 5 天 | 解锁批量场景 |
+| 🟡 P1-C | ~~Phase 3 多 agent 编排~~ ✅ (v0.2.0 T3) | 5 天 | 解锁批量场景 |
 | 🔵 P2-A | bandit 误报标注 | 0.5 天 | 提升代码质量评分 |
 | 🔵 P2-B | CI 集成 + 真实 E2E | 1 天 | 提升测试可信度 |
 

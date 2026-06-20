@@ -14,3 +14,9 @@ htmlcov/
 dist/
 build/
 .pytest_cache/
+
+# Stray SQLite ':memory:' databases accidentally written to disk when
+# a Python script passes the literal string ":memory:" as a *path*
+# instead of using it as a connection argument. SQLite happily creates
+# a file with that name in the current working directory.
+*:memory:
