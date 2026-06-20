@@ -1,0 +1,18 @@
+"""Prometheus metrics endpoint."""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, Response
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+
+router = APIRouter(tags=["metrics"])
+
+
+@router.get("/metrics")
+async def metrics() -> Response:
+    """Return Prometheus metrics in text format."""
+    metrics_data = generate_latest()
+    return Response(
+        content=metrics_data,
+        media_type=CONTENT_TYPE_LATEST,
+    )
