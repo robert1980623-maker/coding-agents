@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
+
+import structlog
 
 from coding_agents.models import (
     AgentType,
@@ -18,7 +19,7 @@ from coding_agents.models import (
     SessionStatus,
 )
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # Convert SessionStatus to string for SQL
 _STATUS_VALUES = {s: s.value for s in SessionStatus}

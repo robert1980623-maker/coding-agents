@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from typing import Any, Optional
 
-logger = logging.getLogger(__name__)
+import structlog
+
+logger = structlog.get_logger(__name__)
 
 
 class SessionRegistry:

@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import sys
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+import structlog
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from coding_agents.agents.factory import get_agent
 from coding_agents.executor import StreamExecutor
+from coding_agents.logging_config import setup_logging
 from coding_agents.models import (
     AgentType,
     Event,
@@ -32,10 +33,19 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 console = Console()
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # Module-level default storage path
 DEFAULT_DB = "~/.coding-agents/data.db"
+
+
+@app.callback()
+def _global_options(
+    log_level: str = typer.Option("INFO", "--log-level", help="Log level: DEBUG, INFO, WARNING, ERROR"),
+    log_json: bool = typer.Option(True, "--log-json/--no-log-json", help="Output logs as JSON lines"),
+) -> None:
+    """Global options for all commands."""
+    setup_logging(level=log_level, json_output=log_json)
 
 
 def _get_storage() -> SQLiteStorage:

@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import time
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Callable, Optional
+
+import structlog
 
 from coding_agents.models import (
     Event,
@@ -18,7 +19,7 @@ from coding_agents.models import (
 )
 from coding_agents.storage.base import StorageBackend
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class SeqCounter:
@@ -232,9 +233,9 @@ class StreamExecutor:
             current_session = await self.store.get_session(session_id)
             if current_session is not None and current_session.status in TERMINAL_STATUSES:
                 logger.info(
-                    "session %s already in terminal state %s, skipping status update",
-                    session_id,
-                    current_session.status.value,
+                    "session_terminal_state_skip_update",
+                    session_id=session_id,
+                    status=current_session.status.value,
                 )
             else:
                 await self.store.update_session(
