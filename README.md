@@ -148,6 +148,7 @@ natively (see v0.2.4 release notes).
 | Skill | When to use |
 | --- | --- |
 | `coding-agents-dispatch` | You need to dispatch a coding-agents session for a project task |
+| `coding-agents-lifecycle` | You need to inspect a session, read its events, or clean up old data |
 | `coding-agents-recovery` | A session is stuck / orphaned; you need to recover |
 | `coding-agents-cost` | You need to budget, monitor, or cap session cost |
 | `coding-agents-skills` | You need to install, update, or share a skill |

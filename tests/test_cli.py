@@ -179,22 +179,31 @@ class TestRecoverCommand:
         assert "marked" in result.stdout.lower()
 
 
-class TestStreamOption:
-    """Test the --stream option for the run command."""
+class TestDispatchOutputContract:
+    """Verify dispatch output is bounded and safe for OpenClaw exec (1MB buffer).
 
-    def test_run_with_stream(self, mock_db: Path, tmp_path: Path):
-        """Verify --stream emits annotated events to stderr with [channel seq=N] format."""
+    Contract:
+    - Only session_id + one JSON result line on stdout/stderr.
+    - Intermediate stdout/stderr must NOT appear in CLI output.
+    - All events are persisted to SQLite and reachable via `tail` / `status`.
+    """
+
+    def test_dispatch_output_is_bounded(self, mock_db: Path, tmp_path: Path):
+        """`dispatch` must NOT echo the agent's stdout line-by-line.
+
+        Old behavior (pre-v0.2.6) wrote one annotated line per event,
+        which easily exceeded the OpenClaw exec 1MB buffer.
+        """
         import sys
         from unittest.mock import patch
 
-        # Use a simple Python command that writes to stdout
+        # Simulate a chatty agent that emits many lines
         fake_command = [
             sys.executable,
             "-c",
-            "print('line1'); print('line2')",
+            "for i in range(100): print(f'chatty line {i}')",
         ]
 
-        # Patch the agent factory to return an adapter that builds our fake command
         class FakeAdapter:
             def build_command(self, prompt, config):
                 return fake_command
@@ -202,40 +211,33 @@ class TestStreamOption:
         with patch("coding_agents.cli.get_agent", return_value=FakeAdapter()):
             result = runner.invoke(
                 app,
-                ["run", "claude", "test prompt", "--stream"],
+                ["dispatch", "claude", "test prompt"],
                 catch_exceptions=False,
             )
 
         assert result.exit_code == 0
-        # Stream mode writes annotations to stderr (captured in result.output by CliRunner)
-        output = result.output
-        # Verify annotations contain [stdout seq=N] format
-        assert "[stdout seq=" in output
-        assert "line1" in output
-        assert "line2" in output
-        # Should also have a session.start annotation
-        assert "[system seq=" in output
+        # Critical: the chatty agent's output must NOT be in CLI output
+        assert "chatty line 0" not in result.output
+        assert "chatty line 99" not in result.output
+        # session_id line and JSON result must be present
+        assert "session_id=" in result.output
+        # Result line is a JSON object with at least session_id + exit_code
+        import json as _json
+        for line in result.output.splitlines():
+            line = line.strip()
+            if line.startswith("{") and line.endswith("}"):
+                parsed = _json.loads(line)
+                if "session_id" in parsed and "exit_code" in parsed:
+                    break
+        else:
+            pytest.fail(f"no result JSON line found in: {result.output!r}")
 
-    def test_run_without_stream_shows_final(self, mock_db: Path, tmp_path: Path):
-        """Verify default (no --stream) shows only final output."""
-        import sys
-        from unittest.mock import patch
-
-        fake_command = [sys.executable, "-c", "print('final output')"]
-
-        class FakeAdapter:
-            def build_command(self, prompt, config):
-                return fake_command
-
-        with patch("coding_agents.cli.get_agent", return_value=FakeAdapter()):
-            result = runner.invoke(
-                app,
-                ["run", "claude", "test prompt"],
-                catch_exceptions=False,
-            )
-
-        assert result.exit_code == 0
-        # Non-stream mode should contain the final output
-        assert "final output" in result.output
-        # But NOT have [stdout seq=...] annotations
-        assert "[stdout seq=" not in result.output
+    def test_dispatch_does_not_accept_stream_flag(self):
+        """The --stream flag was removed in v0.2.6. dispatch must reject it."""
+        result = runner.invoke(
+            app,
+            ["dispatch", "claude", "test", "--stream"],
+        )
+        assert result.exit_code != 0
+        # Should fail with "no such option"
+        assert "no such option" in result.output or "--stream" in result.output

@@ -37,7 +37,9 @@ console = Console()
 logger = structlog.get_logger(__name__)
 
 # Module-level default storage path
-DEFAULT_DB = "~/.coding-agents/data.db"
+import os
+_DEFAULT_DB = "~/.coding-agents/data.db"
+DEFAULT_DB = os.environ.get("CODING_AGENTS_DB", _DEFAULT_DB)
 
 
 @app.callback()
@@ -65,7 +67,9 @@ def _global_options(
 
 
 def _get_storage() -> SQLiteStorage:
-    return SQLiteStorage(DEFAULT_DB)
+    """Resolve DB path at call time so tests can override via env or attribute."""
+    # Honor env override at runtime (tests can monkeypatch.setenv).
+    return SQLiteStorage(os.environ.get("CODING_AGENTS_DB", DEFAULT_DB))
 
 
 def _run_async(coro: Any) -> Any:
@@ -107,10 +111,6 @@ def dispatch(
     ),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Model override"),
     budget: Optional[float] = typer.Option(None, "--budget", "-b", help="Max budget in USD"),
-    stream: bool = typer.Option(
-        True, "--stream/--no-stream",
-        help="Stream subprocess stdout/stderr in real-time (default: on)",
-    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ) -> None:
     """Dispatch a coding agent session in the current project.
@@ -120,6 +120,12 @@ def dispatch(
     AGENTS.md / CLAUDE.md / .claude/skills/ natively — no prompt injection
     needed.
 
+    Output is bounded: dispatch only prints the final result event
+    (one JSON line, < 1KB) plus the session id. All intermediate
+    stdout/stderr goes to SQLite. Use ``coding-agents status <id>`` or
+    ``coding-agents tail <id>`` to inspect the full stream — this
+    keeps dispatch output safely below the OpenClaw exec 1MB buffer.
+
     Example:
         coding-agents dispatch claude "fix the auth bug" --workdir ~/project
     """
@@ -127,7 +133,7 @@ def dispatch(
     # the agent subprocess actually sees.
     effective_workdir = workdir or "."
     _run_async(
-        _run_session(agent, prompt, effective_workdir, model, budget, "standard", stream, verbose)
+        _run_session(agent, prompt, effective_workdir, model, budget, "standard", verbose)
     )
 
 
@@ -138,9 +144,15 @@ async def _run_session(
     model: Optional[str],
     budget: Optional[float],
     output_mode: str,
-    stream: bool,
     verbose: bool,
 ) -> None:
+    """Run the agent subprocess and persist events to SQLite.
+
+    Output contract: only the final result event (one line) plus the
+    session id are written to stdout/stderr. Everything else is
+    persisted to SQLite and retrieved with `status` / `tail`.
+    This keeps dispatch output safely below the OpenClaw exec 1MB buffer.
+    """
     try:
         agent_type = AgentType(agent_name)
     except ValueError:
@@ -161,6 +173,9 @@ async def _run_session(
 
     session = Session(agent=agent_type, prompt=prompt, workdir=workdir, model=model)
     await storage.create_session(session)
+    # Always print the session id early so the caller can poll status
+    # / tail even if dispatch is killed by the 1MB buffer.
+    console.print(f"session_id={session.id}")
 
     registry = SessionRegistry()
     acquired = await registry.acquire(session.id)
@@ -176,57 +191,17 @@ async def _run_session(
         raise typer.Exit(code=1)
 
     executor = StreamExecutor(store=storage, config=config)
-
-    last_stdout_data = ""
-    last_stderr_data = ""
     exit_code: Optional[int] = None
+    error_text: Optional[str] = None
 
     try:
         async for event in executor.execute(session.id, command, workdir):
-            if event.type == EventType.STDOUT:
-                if stream:
-                    sys.stderr.write(f"[stdout seq={event.seq}] {event.data}")
-                    if not event.data.endswith("\n"):
-                        sys.stderr.write("\n")
-                    sys.stderr.flush()
-                else:
-                    last_stdout_data = event.data
-            elif event.type == EventType.STDERR:
-                if stream:
-                    sys.stderr.write(f"[stderr seq={event.seq}] {event.data}")
-                    if not event.data.endswith("\n"):
-                        sys.stderr.write("\n")
-                    sys.stderr.flush()
-                else:
-                    last_stderr_data = event.data
-            elif event.type == EventType.RESULT:
+            # All events flow to SQLite. We only act on the terminal ones.
+            if event.type == EventType.RESULT:
                 data = json.loads(event.data)
                 exit_code = data.get("exit_code")
-                if not stream:
-                    # In non-stream mode, print the final output
-                    if last_stdout_data:
-                        sys.stdout.write(last_stdout_data)
-                        if not last_stdout_data.endswith("\n"):
-                            sys.stdout.write("\n")
-                        sys.stdout.flush()
-                    if last_stderr_data:
-                        sys.stderr.write(last_stderr_data)
-                        if not last_stderr_data.endswith("\n"):
-                            sys.stderr.write("\n")
-                        sys.stderr.flush()
-                if verbose or stream:
-                    console.print(f"[dim]exit_code={exit_code}[/dim]")
-            elif event.type == EventType.ERROR and stream:
-                sys.stderr.write(f"[error seq={event.seq}] {event.data}\n")
-                sys.stderr.flush()
-            elif event.type == EventType.SESSION_START and stream:
-                start_data = json.loads(event.data)
-                sys.stderr.write(
-                    f"[system seq={event.seq}] session started: "
-                    f"{start_data.get('session_id', '')[:8]} "
-                    f"agent={start_data.get('agent', '?')}\n"
-                )
-                sys.stderr.flush()
+            elif event.type == EventType.ERROR:
+                error_text = event.data
     except Exception as e:
         console.print(f"[red]Execution error: {e}[/red]")
         await storage.update_session(
@@ -237,18 +212,44 @@ async def _run_session(
         )
     finally:
         await registry.release(session.id)
-        await storage.close()
+
+    # Emit a single bounded result line so the caller knows how it ended.
+    result_line = {
+        "session_id": session.id,
+        "exit_code": exit_code,
+        "error": error_text,
+    }
+    sys.stdout.write(json.dumps(result_line, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+    await storage.close()
+
+    if verbose:
+        console.print(f"[dim]full event stream: coding-agents tail {session.id}[/dim]")
 
 
 @app.command()
 def status(
     session_id: str = typer.Argument(..., help="Session ID"),
+    limit: int = typer.Option(
+        20, "--limit", "-n",
+        help="Number of recent events to show (default: 20). "
+             "Keeps output below the OpenClaw exec 1MB buffer.",
+    ),
+    no_events: bool = typer.Option(
+        False, "--no-events",
+        help="Skip events, show only session metadata.",
+    ),
 ) -> None:
-    """Show the status of a session."""
-    _run_async(_show_status(session_id))
+    """Show session metadata + the most recent events.
+
+    By default prints the last 20 events (oldest-first within the window).
+    Use `tail` if you want a longer or full stream.
+    """
+    _run_async(_show_status(session_id, limit, no_events))
 
 
-async def _show_status(session_id: str) -> None:
+async def _show_status(session_id: str, limit: int, no_events: bool) -> None:
     storage = _get_storage()
     await storage.initialize()
     try:
@@ -258,6 +259,78 @@ async def _show_status(session_id: str) -> None:
             raise typer.Exit(code=1)
         tags = await storage.list_tags(session_id)
         _print_session(session, tags)
+        if not no_events:
+            events = await storage.get_latest_events(session_id, limit=limit)
+            if events:
+                console.print(f"\n[bold]recent {len(events)} event(s)[/bold]")
+                for ev in events:
+                    _print_event_summary(ev)
+            else:
+                console.print("\n[dim](no events recorded)[/dim]")
+    finally:
+        await storage.close()
+
+
+def _print_event_summary(ev) -> None:
+    """One-line summary for an event — bounded so 20 lines fit easily."""
+    type_short = ev.type.value if hasattr(ev.type, "value") else str(ev.type)
+    data_preview = ev.data if isinstance(ev.data, str) else str(ev.data)
+    if len(data_preview) > 200:
+        data_preview = data_preview[:200] + "..."
+    console.print(f"  [dim]seq={ev.seq}[/dim] [{type_short}] {data_preview}")
+
+
+@app.command(name="tail")
+def tail_cmd(
+    session_id: str = typer.Argument(..., help="Session ID"),
+    limit: int = typer.Option(
+        100, "--limit", "-n",
+        help="Number of events to show (default: 100, oldest-first).",
+    ),
+    follow: bool = typer.Option(
+        False, "--follow", "-f",
+        help="Poll for new events until the session reaches a terminal status. "
+             "WARNING: do not use from inside OpenClaw exec — the polling will "
+             "hit the 1MB buffer. Use `status` or read SQLite directly.",
+    ),
+) -> None:
+    """Show the most recent events of a session (one-line summaries).
+
+    Like `status` but with a larger default window. Output is bounded so
+    it fits inside the OpenClaw exec 1MB buffer.
+    """
+    _run_async(_tail_session(session_id, limit, follow))
+
+
+async def _tail_session(session_id: str, limit: int, follow: bool) -> None:
+    storage = _get_storage()
+    await storage.initialize()
+    try:
+        session = await storage.get_session(session_id)
+        if session is None:
+            console.print(f"[red]Session not found: {session_id}[/red]")
+            raise typer.Exit(code=1)
+        events = await storage.get_latest_events(session_id, limit=limit)
+        if events:
+            console.print(f"[bold]{len(events)} most recent event(s)[/bold]")
+            for ev in events:
+                _print_event_summary(ev)
+        else:
+            console.print("[dim](no events recorded)[/dim]")
+        if follow:
+            from coding_agents.models import SessionStatus
+            last_seq = events[-1].seq if events else 0
+            while not session.status.is_terminal:
+                await asyncio.sleep(1.0)
+                new_events = await storage.get_events(
+                    session_id, after_seq=last_seq, limit=limit
+                )
+                for ev in new_events:
+                    _print_event_summary(ev)
+                    last_seq = ev.seq
+                session = await storage.get_session(session_id)
+                if session is None:
+                    break
     finally:
         await storage.close()
 
@@ -438,6 +511,126 @@ def _print_session(session: Session, tags: list[str]) -> None:
         console.print(f"  Model: {session.model}")
     if tags:
         console.print(f"  Tags: {', '.join(tags)}")
+
+
+@app.command(name="gc")
+def gc(
+    older_than_days: int = typer.Option(
+        30, "--older-than", "-d",
+        help="Drop completed sessions older than N days (default: 30).",
+    ),
+    failed_after_days: int = typer.Option(
+        7, "--failed-after",
+        help="Drop failed sessions older than N days (default: 7).",
+    ),
+    keep_result_only: bool = typer.Option(
+        False, "--keep-result-only",
+        help="For retained sessions, drop all stdout/stderr events but "
+             "keep the result event. Frees disk; loses intermediate output.",
+    ),
+    vacuum: bool = typer.Option(
+        True, "--vacuum/--no-vacuum",
+        help="Run VACUUM after deletes to reclaim disk space (default: on).",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", "-n",
+        help="Report what would be deleted without actually deleting.",
+    ),
+) -> None:
+    """Garbage-collect old / completed sessions to keep SQLite bounded.
+
+    Defaults are conservative: keeps 30 days of completed sessions and
+    7 days of failed sessions. Use `--keep-result-only` to further prune
+    intermediate events while preserving the final answer.
+
+    For sessions in the running state older than 24h, they are marked
+    as orphaned (not deleted) — recover those separately with
+    `coding-agents recover`.
+    """
+    _run_async(
+        _gc_sessions(
+            older_than_days,
+            failed_after_days,
+            keep_result_only,
+            vacuum,
+            dry_run,
+        )
+    )
+
+
+async def _gc_sessions(
+    older_than_days: int,
+    failed_after_days: int,
+    keep_result_only: bool,
+    vacuum: bool,
+    dry_run: bool,
+) -> None:
+    """Implementation of `gc`."""
+    from datetime import timedelta
+    from coding_agents.models import EventType, SessionStatus
+
+    storage = _get_storage()
+    await storage.initialize()
+    try:
+        sessions = await storage.list_sessions()
+        now = datetime.now(timezone.utc)
+        completed_cutoff = now - timedelta(days=older_than_days)
+        failed_cutoff = now - timedelta(days=failed_after_days)
+        orphan_cutoff = now - timedelta(hours=24)
+
+        to_drop_sids: list[str] = []
+        to_prune_sids: list[str] = []
+        to_orphan_sids: list[str] = []
+        for s in sessions:
+            if s.status in (SessionStatus.COMPLETED, SessionStatus.KILLED, SessionStatus.TIMEOUT):
+                if s.finished_at and s.finished_at < completed_cutoff:
+                    to_drop_sids.append(s.id)
+            elif s.status == SessionStatus.FAILED:
+                if s.finished_at and s.finished_at < failed_cutoff:
+                    to_drop_sids.append(s.id)
+            elif s.status == SessionStatus.RUNNING:
+                # Orphan: still running but no activity for 24h.
+                if s.started_at and s.started_at < orphan_cutoff:
+                    to_orphan_sids.append(s.id)
+
+        if keep_result_only:
+            to_prune_sids = [s.id for s in sessions if s.id not in to_drop_sids]
+
+        verb = "would drop" if dry_run else "dropping"
+        if to_drop_sids:
+            console.print(f"[bold]{verb} {len(to_drop_sids)} session(s)[/bold]")
+            for sid in to_drop_sids:
+                if not dry_run:
+                    await storage.delete_session(sid)
+                else:
+                    console.print(f"  - {sid}")
+
+        if to_orphan_sids:
+            verb2 = "would mark orphaned" if dry_run else "marking orphaned"
+            console.print(f"[bold]{verb2} {len(to_orphan_sids)} session(s)[/bold]")
+            for sid in to_orphan_sids:
+                if not dry_run:
+                    await storage.update_session(
+                        sid,
+                        status=SessionStatus.ORPHANED,
+                        finished_at=now,
+                        metadata={"orphan_reason": "gc: 24h no activity"},
+                    )
+
+        if keep_result_only and to_prune_sids and not dry_run:
+            pruned_total = 0
+            for sid in to_prune_sids:
+                pruned_total += await storage.prune_events_keep_result(sid)
+            console.print(f"[bold]pruned {pruned_total} intermediate event(s)[/bold]")
+
+        if not dry_run and vacuum and (to_drop_sids or to_prune_sids):
+            console.print("[dim]running VACUUM...[/dim]")
+            await storage.vacuum()
+
+        if not (to_drop_sids or to_orphan_sids or to_prune_sids):
+            console.print("[green]nothing to gc[/green]")
+    finally:
+        await storage.close()
 
 
 # Register skill sub-commands

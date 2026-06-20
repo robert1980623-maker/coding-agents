@@ -76,6 +76,18 @@ class StorageBackend(Protocol):
         """Get events for a session, optionally after a given seq."""
         ...
 
+    async def get_latest_events(
+        self,
+        session_id: str,
+        limit: int = 20,
+    ) -> list[Event]:
+        """Return the last N events for a session, oldest-first.
+
+        Designed for the `status` command: bounded output so it fits
+        inside the OpenClaw exec 1MB buffer.
+        """
+        ...
+
     def stream_events(
         self,
         session_id: str,
@@ -97,4 +109,20 @@ class StorageBackend(Protocol):
 
     async def recover_orphaned_sessions(self, timeout_seconds: int = 300) -> int:
         """Scan and mark orphaned sessions. Returns the count marked."""
+        ...
+
+    async def delete_session(self, session_id: str) -> None:
+        """Delete a session and all its events."""
+        ...
+
+    async def prune_events_keep_result(self, session_id: str) -> int:
+        """Drop stdout/stderr events for a session, keep the result event.
+
+        Returns the number of events deleted. Used by `gc` to free disk
+        while preserving the final answer.
+        """
+        ...
+
+    async def vacuum(self) -> None:
+        """Run SQLite VACUUM to reclaim disk space after deletes."""
         ...

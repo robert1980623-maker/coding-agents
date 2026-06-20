@@ -355,6 +355,31 @@ class SQLiteStorage:
         rows = await asyncio.to_thread(cursor.fetchall)
         return [self._row_to_event(r) for r in rows]
 
+    async def get_latest_events(
+        self,
+        session_id: str,
+        limit: int = 20,
+    ) -> list[Event]:
+        """Return the last N events for a session, oldest-first.
+
+        Bounded output designed for the `status` / `tail` commands so they
+        fit inside the OpenClaw exec 1MB buffer.
+        """
+        conn = await self._get_conn()
+        # Fetch newest N via subquery, then re-sort ascending so the
+        # caller sees events in natural reading order.
+        sql = (
+            "SELECT * FROM ("
+            "  SELECT * FROM events WHERE session_id = ?"
+            "  ORDER BY seq DESC LIMIT ?"
+            ") ORDER BY seq ASC"
+        )
+        cursor = await asyncio.to_thread(
+            conn.execute, sql, [session_id, limit]
+        )
+        rows = await asyncio.to_thread(cursor.fetchall)
+        return [self._row_to_event(r) for r in rows]
+
     async def stream_events(
         self,
         session_id: str,
@@ -459,6 +484,54 @@ class SQLiteStorage:
             )
             await asyncio.to_thread(conn.commit)
             return cursor.rowcount
+
+    async def delete_session(self, session_id: str) -> None:
+        """Delete a session and all its events (and tags)."""
+        conn = await self._get_conn()
+        async with self._lock:
+            await asyncio.to_thread(
+                conn.execute,
+                "DELETE FROM session_tags WHERE session_id = ?",
+                (session_id,),
+            )
+            await asyncio.to_thread(
+                conn.execute,
+                "DELETE FROM events WHERE session_id = ?",
+                (session_id,),
+            )
+            await asyncio.to_thread(
+                conn.execute,
+                "DELETE FROM sessions WHERE id = ?",
+                (session_id,),
+            )
+            await asyncio.to_thread(conn.commit)
+
+    async def prune_events_keep_result(self, session_id: str) -> int:
+        """Drop all events for a session EXCEPT its result event.
+
+        Returns the number of events deleted. If the session has no
+        result event, all events are deleted.
+        """
+        conn = await self._get_conn()
+        async with self._lock:
+            cursor = await asyncio.to_thread(
+                conn.execute,
+                """
+                DELETE FROM events
+                WHERE session_id = ?
+                  AND NOT (channel = 'system' AND type = 'result')
+                """,
+                (session_id,),
+            )
+            await asyncio.to_thread(conn.commit)
+            return cursor.rowcount
+
+    async def vacuum(self) -> None:
+        """Run SQLite VACUUM to reclaim disk space after deletes."""
+        conn = await self._get_conn()
+        # VACUUM cannot run inside a transaction.
+        async with self._lock:
+            await asyncio.to_thread(conn.execute, "VACUUM")
 
 
 SCHEMA_SQL = """
