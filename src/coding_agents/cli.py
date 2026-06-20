@@ -85,7 +85,6 @@ def run(
     model: Optional[str] = typer.Option(None, help="Model override"),
     budget: Optional[float] = typer.Option(None, help="Max budget in USD"),
     output_mode: str = typer.Option("standard", help="Output mode: standard or passthrough"),
-    stream: bool = typer.Option(False, "--stream", help="Stream events in real-time with annotations"),
     verbose: bool = typer.Option(False, help="Verbose output"),
 ) -> None:
     """[DEPRECATED] Run a coding agent session. Use 'dispatch' instead."""
@@ -95,7 +94,7 @@ def run(
         DeprecationWarning,
         stacklevel=2,
     )
-    _run_async(_run_session(agent, prompt, workdir, model, budget, output_mode, stream, verbose))
+    _run_async(_run_session(agent, prompt, workdir, model, budget, output_mode, verbose))
 
 
 @app.command(name="dispatch")
