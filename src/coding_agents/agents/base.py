@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Any, Optional
 
 from coding_agents.models import ExecutionConfig
 
@@ -17,7 +17,7 @@ class BaseAgent(ABC):
         ...
 
     @abstractmethod
-    def parse_output(self, line: str) -> Optional[dict]:
+    def parse_output(self, line: str) -> Optional[dict[str, Any]]:
         """Parse a single line of output, returning structured data or None."""
         ...
 

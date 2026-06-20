@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +19,7 @@ class SessionRegistry:
 
     def __init__(self, max_concurrent: int = 5):
         self._semaphore = asyncio.Semaphore(max_concurrent)
-        self._active_sessions: dict[str, asyncio.Task] = {}
+        self._active_sessions: dict[str, asyncio.Task[Any]] = {}
         self._lock = asyncio.Lock()
         self._acquired: set[str] = set()
         self._max_concurrent = max_concurrent
@@ -30,7 +30,7 @@ class SessionRegistry:
 
     @property
     def available_slots(self) -> int:
-        return self._semaphore._value  # type: ignore[attr-defined]
+        return self._semaphore._value
 
     async def acquire(self, session_id: str, timeout: float = 60.0) -> bool:
         """Acquire an execution slot for a session.
@@ -47,9 +47,17 @@ class SessionRegistry:
         except asyncio.TimeoutError:
             return False
 
-        # Record after semaphore acquired
+        # Record after semaphore acquired; re-check under lock to close the
+        # race window between the initial check and the semaphore wait.
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("no current task")
         async with self._lock:
-            self._active_sessions[session_id] = asyncio.current_task()
+            if session_id in self._acquired:
+                # Another coroutine acquired it while we waited for the semaphore.
+                self._semaphore.release()
+                raise RuntimeError(f"session {session_id} already acquired")
+            self._active_sessions[session_id] = task
             self._acquired.add(session_id)
         return True
 

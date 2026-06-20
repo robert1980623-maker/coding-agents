@@ -34,3 +34,10 @@ pythonpath = ["src"]
 [tool.coverage.run]
 source = ["coding_agents"]
 omit = ["tests/*"]
+
+[dependency-groups]
+dev = [
+    "bandit>=1.9.4",
+    "mypy>=2.1.0",
+    "pip-audit>=2.10.1",
+]

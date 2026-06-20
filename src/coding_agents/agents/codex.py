@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from coding_agents.agents.base import BaseAgent
 from coding_agents.models import ExecutionConfig
@@ -29,7 +29,7 @@ class CodexAgent(BaseAgent):
         cmd.append(prompt)
         return cmd
 
-    def parse_output(self, line: str) -> Optional[dict]:
+    def parse_output(self, line: str) -> Optional[dict[str, Any]]:
         """Parse Codex --json output."""
         try:
             event = json.loads(line)

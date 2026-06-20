@@ -50,7 +50,8 @@ def _json_to_dict(s: Optional[str]) -> dict[str, Any]:
     if s is None:
         return {}
     try:
-        return json.loads(s)
+        result = json.loads(s)
+        return result if isinstance(result, dict) else {}
     except (json.JSONDecodeError, TypeError):
         return {}
 
@@ -74,7 +75,9 @@ class SQLiteStorage:
         return self._conn
 
     def _open_conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self._db_path))
+        # check_same_thread=False is required because asyncio.to_thread may run
+        # on different threads from the pool across calls.
+        conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
@@ -140,12 +143,12 @@ class SQLiteStorage:
 
     async def get_session(self, session_id: str) -> Optional[Session]:
         conn = await self._get_conn()
-        row = await asyncio.to_thread(
+        cursor = await asyncio.to_thread(
             conn.execute,
             "SELECT * FROM sessions WHERE id = ?",
             (session_id,),
         )
-        row = await asyncio.to_thread(row.fetchone)
+        row = await asyncio.to_thread(cursor.fetchone)
         if row is None:
             return None
         return self._row_to_session(row)

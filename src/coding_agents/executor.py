@@ -319,12 +319,14 @@ class StreamExecutor:
         if event.get("type") == "assistant":
             content = event.get("message", {}).get("content", [])
             if content and content[0].get("type") == "text":
-                return content[0].get("text", "")
+                text = content[0].get("text", "")
+                return str(text) if text else ""
         # Codex: item.text
         if event.get("type") == "item.completed":
             item = event.get("item", {})
             if item.get("type") == "agent_message":
-                return item.get("text", "")
+                text = item.get("text", "")
+                return str(text) if text else ""
         return line
 
     async def _flush_if_needed(self) -> None:

@@ -6,8 +6,8 @@ import asyncio
 import json
 import logging
 import sys
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 import typer
 from rich.console import Console
@@ -42,7 +42,7 @@ def _get_storage() -> SQLiteStorage:
     return SQLiteStorage(DEFAULT_DB)
 
 
-def _run_async(coro):
+def _run_async(coro: Any) -> Any:
     """Run an async function in a sync CLI context."""
     return asyncio.run(coro)
 
@@ -98,7 +98,7 @@ async def _run_session(
         await storage.update_session(
             session.id,
             status=SessionStatus.FAILED,
-            finished_at=datetime.now(),
+            finished_at=datetime.now(timezone.utc),
             metadata={"error": "Timed out waiting for execution slot"},
         )
         await storage.close()
@@ -123,7 +123,7 @@ async def _run_session(
         await storage.update_session(
             session.id,
             status=SessionStatus.FAILED,
-            finished_at=datetime.now(),
+            finished_at=datetime.now(timezone.utc),
             metadata={"error": str(e)},
         )
     finally:
@@ -253,7 +253,7 @@ async def _kill_session(session_id: str) -> None:
         await storage.update_session(
             session_id,
             status=SessionStatus.KILLED,
-            finished_at=datetime.now(),
+            finished_at=datetime.now(timezone.utc),
         )
         console.print(f"[green]Killed session {session_id}[/green]")
     finally:

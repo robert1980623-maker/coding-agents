@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from coding_agents.agents.base import BaseAgent
 from coding_agents.models import ExecutionConfig
@@ -35,7 +35,7 @@ class ClaudeAgent(BaseAgent):
         cmd.append(prompt)
         return cmd
 
-    def parse_output(self, line: str) -> Optional[dict]:
+    def parse_output(self, line: str) -> Optional[dict[str, Any]]:
         """Parse Claude Code stream-json output.
 
         Extracts cost/tokens from the 'result' event type.
@@ -66,7 +66,8 @@ class ClaudeAgent(BaseAgent):
                     continue
                 event = json.loads(line)
                 if event.get("type") == "result":
-                    return event.get("total_cost_usd")
-        except (json.JSONDecodeError, ValueError):
+                    cost = event.get("total_cost_usd")
+                    return float(cost) if cost is not None else None
+        except (json.JSONDecodeError, ValueError, TypeError):
             pass
         return None

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import AsyncIterator, Optional, Protocol, runtime_checkable
+from typing import Any, AsyncIterator, Optional, Protocol, runtime_checkable
 
 from coding_agents.models import Event, Session
 
@@ -33,7 +33,7 @@ class StorageBackend(Protocol):
         """Retrieve a session by id."""
         ...
 
-    async def update_session(self, session_id: str, **kwargs) -> None:
+    async def update_session(self, session_id: str, **kwargs: Any) -> None:
         """Update fields on an existing session."""
         ...
 
@@ -76,7 +76,7 @@ class StorageBackend(Protocol):
         """Get events for a session, optionally after a given seq."""
         ...
 
-    async def stream_events(
+    def stream_events(
         self,
         session_id: str,
         after_seq: int = 0,
