@@ -4,7 +4,6 @@ This module provides a FastAPI-based HTTP server for managing coding agent sessi
 
 Main components:
 - `server.create_app()`: Factory function to create the FastAPI app
-- `server.app`: Default app instance
 - `auth.verify_token()`: Bearer token authentication dependency
 - `sse.format_event_as_sse()`: SSE event formatting
 
@@ -17,6 +16,6 @@ Usage:
     app = create_app(db_path="my.db")
 """
 
-from coding_agents.http.server import app, create_app
+from coding_agents.http.server import create_app
 
-__all__ = ["app", "create_app"]
+__all__ = ["create_app"]

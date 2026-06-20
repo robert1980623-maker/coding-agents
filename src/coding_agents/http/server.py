@@ -80,7 +80,3 @@ def create_app(db_path: str = "~/.coding-agents/data.db") -> FastAPI:
         )
 
     return app
-
-
-# Default app instance for uvicorn
-app = create_app()
