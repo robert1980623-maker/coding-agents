@@ -1,0 +1,1 @@
+../../../.coding-agents/skills/coding-agents-lifecycle/SKILL.md
