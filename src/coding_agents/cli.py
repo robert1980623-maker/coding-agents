@@ -159,9 +159,11 @@ async def _run_session(
         raise typer.Exit(code=1)
 
     adapter = get_agent(agent_type)
-    config = ExecutionConfig(output_mode=output_mode, model=model)
-    if budget is not None:
-        config.max_budget_usd = budget
+    config = ExecutionConfig(
+        output_mode=output_mode,
+        model=model,
+        max_budget_usd=budget,  # None means "no cap"; agents honor or warn
+    )
 
     command = adapter.build_command(prompt, config)
     if verbose:

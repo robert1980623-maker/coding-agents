@@ -29,13 +29,14 @@ class CodexAgent(BaseAgent):
 
         # Codex CLI does not support a per-session cost/budget cap.
         # It bills via OpenAI ChatGPT subscription (not per-token), so
-        # there is no `--max-budget-usd` flag (v0.2.7). Warn the user
-        # if they passed --budget so they know it is a no-op.
+        # there is no `--max-budget-usd` flag. Warn the user when they
+        # explicitly set --budget so they know it is a no-op.
+        # (Default budget is None — no warning when user did not opt in.)
         if config.max_budget_usd is not None:
             logger.warning(
-                "codex-agent: --budget is a no-op for codex; "
-                "codex CLI has no --max-budget-usd flag. "
-                "codex uses ChatGPT subscription billing, not per-token cost.",
+                "codex-agent: --budget is ignored; codex CLI has no "
+                "--max-budget-usd flag (subscription billing). "
+                "Use --agent claude if you need a hard cost cap.",
             )
 
         # Note: We intentionally do NOT inject coding-agents skills into

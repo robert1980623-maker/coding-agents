@@ -137,7 +137,7 @@ class TestExecutionConfig:
         assert c.timeout_seconds == 3600
         assert c.idle_timeout_seconds == 300
         assert c.max_memory_mb == 4096
-        assert c.max_budget_usd == 10.0
+        assert c.max_budget_usd is None  # v0.2.9: None means "no cap"
         assert c.output_mode == "standard"
         assert c.line_limit == 8 * 1024 * 1024
         assert c.model is None

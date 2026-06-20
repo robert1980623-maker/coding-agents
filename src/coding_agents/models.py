@@ -138,7 +138,11 @@ class ExecutionConfig:
 
     # Resource limits
     max_memory_mb: int = 4096
-    max_budget_usd: float = 10.0
+    # None means "no cap". Default is None so that agents which do not
+    # support a budget flag (e.g. codex) do not get spurious warnings,
+    # and so that codex/claude behave identically when the user does
+    # not pass --budget.
+    max_budget_usd: Optional[float] = None
 
     # Retry
     max_retries: int = 0

@@ -27,7 +27,7 @@ class ClaudeAgent(BaseAgent):
             "bypassPermissions",
         ]
 
-        if config.max_budget_usd:
+        if config.max_budget_usd is not None:
             cmd.extend(["--max-budget-usd", str(config.max_budget_usd)])
 
         if config.model:

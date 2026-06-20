@@ -131,6 +131,35 @@ class TestCodexAgent:
                    for e, _ in captured), \
             f"expected budget warning, got: {captured}"
 
+    def test_build_command_no_budget_no_warning(self, monkeypatch):
+        """Regression guard: codex must NOT warn when the user did not
+        pass --budget (max_budget_usd is None by default after v0.2.9).
+
+        Without this guard, every default codex dispatch would log a
+        spurious 'budget is a no-op' warning — which is the exact bug
+        introduced and fixed in v0.2.9.
+        """
+        captured: list[tuple[str, str]] = []
+
+        from coding_agents.agents import codex as codex_mod
+        orig_warning = codex_mod.logger.warning
+
+        def _capture(event: str, *args, **kwargs):
+            captured.append((event, str(args)))
+            orig_warning(event, *args, **kwargs)
+
+        monkeypatch.setattr(codex_mod.logger, "warning", _capture)
+
+        agent = CodexAgent()
+        # Default config — no max_budget_usd set.
+        config = ExecutionConfig()
+        cmd = agent.build_command("test", config)
+
+        # No budget flag, no warning
+        assert "--max-budget-usd" not in cmd
+        assert captured == [], \
+            f"unexpected warnings on default config: {captured}"
+
     def test_parse_output_turn_completed(self):
         agent = CodexAgent()
         line = json.dumps({
