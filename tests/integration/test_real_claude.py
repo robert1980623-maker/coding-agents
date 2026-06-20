@@ -38,17 +38,61 @@ skip_no_binary = pytest.mark.skipif(
 
 
 def _check_claude_auth() -> bool:
-    """Return True if claude CLI appears to be authenticated."""
+    """Return True if claude CLI is authenticated for actual API calls.
+
+    Runs a minimal API call to verify authentication, not just binary presence.
+    """
     if not HAS_CLAUDE:
         return False
     try:
+        # Quick version check first
         result = subprocess.run(
             [CLAUDE_BINARY, "--version"],
             capture_output=True,
             text=True,
             timeout=10,
         )
-        return result.returncode == 0
+        if result.returncode != 0:
+            return False
+
+        # Try a minimal API call with minimal cost
+        result = subprocess.run(
+            [
+                CLAUDE_BINARY, "-p",
+                "--verbose",
+                "--output-format", "stream-json",
+                "--permission-mode", "bypassPermissions",
+                "--max-budget-usd", "0.5",
+                "--model", "haiku",
+                "Reply with only the word OK",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode == 0:
+            return True
+
+        # Check if we got a result event — means API works even if budget was exceeded
+        for line in result.stdout.splitlines():
+            try:
+                event = json.loads(line.strip())
+                if event.get("type") == "result":
+                    return True
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+        # Check for auth-related errors in output
+        combined = (result.stdout + result.stderr).lower()
+        auth_keywords = [
+            "auth", "login", "api key", "unauthorized", "forbidden",
+            "not authenticated", "sign in", "signin",
+        ]
+        for kw in auth_keywords:
+            if kw in combined:
+                return False
+
+        return False
     except (subprocess.TimeoutExpired, OSError):
         return False
 
@@ -57,7 +101,7 @@ HAS_CLAUDE_AUTH = _check_claude_auth()
 
 skip_no_auth = pytest.mark.skipif(
     not HAS_CLAUDE_AUTH,
-    reason="claude CLI not authenticated (run `claude login` or set ANTHROPIC_API_KEY)",
+    reason="claude CLI not authenticated for API calls (run `claude login` or set ANTHROPIC_API_KEY)",
 )
 
 
@@ -166,7 +210,7 @@ class TestClaudeRealExecution:
         Verifies stream-json output contains a 'result' event.
         """
         agent = ClaudeAgent()
-        config = ExecutionConfig(max_budget_usd=0.05, model="haiku")
+        config = ExecutionConfig(max_budget_usd=0.5, model="haiku")
         cmd = agent.build_command("Say hello in exactly 3 words", config)
 
         result = subprocess.run(
@@ -176,21 +220,17 @@ class TestClaudeRealExecution:
             timeout=120,
         )
 
+        # Check for auth failure in stderr
         if result.returncode != 0:
-            # Check for auth failure
             stderr_lower = result.stderr.lower()
             if any(
                 kw in stderr_lower
                 for kw in ("auth", "login", "api key", "unauthorized", "forbidden")
             ):
                 pytest.skip(f"claude auth failed: {result.stderr[:200]}")
-            pytest.fail(
-                f"claude CLI returned {result.returncode}\n"
-                f"stdout: {result.stdout[:500]}\n"
-                f"stderr: {result.stderr[:500]}"
-            )
 
         # Parse stream-json output — should contain at least one result event
+        # (exit code may be non-zero if budget was exceeded, but output is still valid)
         found_result = False
         parsed_events = []
         for line in result.stdout.splitlines():
@@ -203,8 +243,9 @@ class TestClaudeRealExecution:
                 found_result = True
 
         assert found_result, (
-            f"No 'result' event found in output.\n"
-            f"First 500 chars of stdout: {result.stdout[:500]}"
+            f"No 'result' event found in output (rc={result.returncode}).\n"
+            f"First 500 chars of stdout: {result.stdout[:500]}\n"
+            f"Stderr: {result.stderr[:500]}"
         )
 
         # The result event should have cost/token info
@@ -218,7 +259,7 @@ class TestClaudeRealExecution:
     def test_claude_real_multiline_output(self):
         """Verify claude produces multiple stream-json events."""
         agent = ClaudeAgent()
-        config = ExecutionConfig(max_budget_usd=0.05, model="haiku")
+        config = ExecutionConfig(max_budget_usd=0.5, model="haiku")
         cmd = agent.build_command(
             "List exactly 3 colors, one per line, nothing else", config
         )
@@ -230,8 +271,9 @@ class TestClaudeRealExecution:
             timeout=120,
         )
 
-        if result.returncode != 0:
-            pytest.skip(f"claude CLI failed (rc={result.returncode}): {result.stderr[:200]}")
+        # Even with non-zero exit (budget exceeded), output may be valid
+        if not result.stdout.strip():
+            pytest.skip(f"claude CLI produced no output (rc={result.returncode}): {result.stderr[:200]}")
 
         # Count JSON events in output
         json_events = []

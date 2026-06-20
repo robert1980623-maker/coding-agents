@@ -15,6 +15,7 @@ import platform
 import subprocess as sync_subprocess
 import tempfile
 import time
+from pathlib import Path
 
 import pytest
 
@@ -65,9 +66,9 @@ def get_process_rss_kb() -> int:
 class TestExecutorRealSubprocess:
     """StreamExecutor with real subprocess execution."""
 
-    async def test_echo_hello(self):
+    async def test_echo_hello(self, tmp_path: Path):
         """Basic echo subprocess — verifies full event lifecycle."""
-        storage = SQLiteStorage(":memory:")
+        storage = SQLiteStorage(tmp_path / "test.db")
         await storage.initialize()
 
         config = ExecutionConfig(timeout_seconds=30)
@@ -107,9 +108,10 @@ class TestExecutorRealSubprocess:
         assert final_session.finished_at is not None
 
         # Verify events stored in DB
+        # Note: RESULT event is yielded to caller but NOT persisted by design
         stored_events = await storage.get_events(session_id)
-        assert len(stored_events) >= 3, (
-            f"Expected >= 3 stored events, got {len(stored_events)}"
+        assert len(stored_events) >= 2, (
+            f"Expected >= 2 stored events (SESSION_START + STDOUT), got {len(stored_events)}"
         )
 
         # Verify seq monotonically increasing
@@ -119,9 +121,9 @@ class TestExecutorRealSubprocess:
 
         await storage.close()
 
-    async def test_failing_command(self):
+    async def test_failing_command(self, tmp_path: Path):
         """Verify FAILED status for non-zero exit code."""
-        storage = SQLiteStorage(":memory:")
+        storage = SQLiteStorage(tmp_path / "test.db")
         await storage.initialize()
 
         config = ExecutionConfig(timeout_seconds=30)
@@ -154,9 +156,9 @@ class TestExecutorRealSubprocess:
 
         await storage.close()
 
-    async def test_stderr_capture(self):
+    async def test_stderr_capture(self, tmp_path: Path):
         """Verify stderr is captured as STDERR events."""
-        storage = SQLiteStorage(":memory:")
+        storage = SQLiteStorage(tmp_path / "test.db")
         await storage.initialize()
 
         config = ExecutionConfig(timeout_seconds=30)
@@ -187,9 +189,9 @@ class TestExecutorRealSubprocess:
 
         await storage.close()
 
-    async def test_event_seq_monotonic_across_channels(self):
+    async def test_event_seq_monotonic_across_channels(self, tmp_path: Path):
         """Verify seq numbers are globally monotonic across stdout+stderr."""
-        storage = SQLiteStorage(":memory:")
+        storage = SQLiteStorage(tmp_path / "test.db")
         await storage.initialize()
 
         config = ExecutionConfig(timeout_seconds=30)
@@ -217,9 +219,9 @@ class TestExecutorRealSubprocess:
 
         await storage.close()
 
-    async def test_command_not_found(self):
+    async def test_command_not_found(self, tmp_path: Path):
         """Verify ERROR event when command doesn't exist."""
-        storage = SQLiteStorage(":memory:")
+        storage = SQLiteStorage(tmp_path / "test.db")
         await storage.initialize()
 
         config = ExecutionConfig(timeout_seconds=30)
@@ -252,18 +254,18 @@ class TestExecutorRealSubprocess:
 class TestExecutorMemoryBaseline:
     """Memory usage baseline tests for StreamExecutor."""
 
-    async def test_large_output_memory(self):
+    async def test_large_output_memory(self, tmp_path: Path):
         """Process 1MB of output and verify memory stays bounded.
 
         Design target: < 50MB growth for 1MB output.
         This verifies the streaming architecture doesn't buffer everything.
         """
-        storage = SQLiteStorage(":memory:")
+        storage = SQLiteStorage(tmp_path / "test.db")
         await storage.initialize()
 
         # Generate 1MB script: 1000 lines × ~1024 bytes each
         line_content = "x" * 1020  # + newline ≈ 1024 bytes per line
-        script_path = os.path.join(tempfile.gettempdir(), "big_output_test.sh")
+        script_path = str(tmp_path / "big_output_test.sh")
         with open(script_path, "w") as f:
             f.write("#!/bin/bash\n")
             for _ in range(1000):
@@ -300,12 +302,6 @@ class TestExecutorMemoryBaseline:
         print(f"[memory] Growth: {growth_mb:.1f} MB")
         print(f"[memory] Events processed: {event_count}")
 
-        # Clean up script
-        try:
-            os.unlink(script_path)
-        except OSError:
-            pass
-
         # Memory growth should be < 50 MB for 1 MB of output
         assert growth_mb < 50, (
             f"Memory growth {growth_mb:.1f} MB exceeds 50 MB target "
@@ -328,9 +324,9 @@ class TestExecutorMemoryBaseline:
 class TestExecutorMultipleSessions:
     """Test running multiple sessions sequentially."""
 
-    async def test_sequential_sessions(self):
+    async def test_sequential_sessions(self, tmp_path: Path):
         """Run 3 sessions sequentially with the same storage."""
-        storage = SQLiteStorage(":memory:")
+        storage = SQLiteStorage(tmp_path / "test.db")
         await storage.initialize()
 
         config = ExecutionConfig(timeout_seconds=30)
