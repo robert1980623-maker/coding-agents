@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -243,6 +244,98 @@ class TestEvents:
         """GET /sessions/:id/events should return 404 for nonexistent session."""
         response = await client.get("/sessions/nonexistent-id/events")
         assert response.status_code == 404
+
+    async def test_sse_stream_receives_realtime_events(
+        self, client: AsyncClient, storage: SQLiteStorage
+    ):
+        """SSE /stream should deliver new events as they are appended."""
+        import asyncio
+
+        from coding_agents.models import Event, EventType, SessionStatus
+
+        # Create a RUNNING session
+        session = Session(
+            agent=AgentType.CLAUDE,
+            prompt="sse test",
+            status=SessionStatus.RUNNING,
+        )
+        await storage.create_session(session)
+
+        # Pre-existing event (seq=1) — should be received immediately
+        await storage.append_events(
+            [
+                Event(
+                    session_id=session.id,
+                    channel="stdout",
+                    seq=1,
+                    type=EventType.STDOUT,
+                    data="pre-existing",
+                )
+            ]
+        )
+
+        received_data: list[str] = []
+
+        async def consume_stream():
+            """Read SSE lines from the streaming response."""
+            async with client.stream(
+                "GET",
+                f"/sessions/{session.id}/events/stream",
+                timeout=httpx.Timeout(30.0, connect=5.0),
+            ) as resp:
+                assert resp.status_code == 200
+                async for line in resp.aiter_lines():
+                    if line.startswith("data:"):
+                        received_data.append(line[len("data:") :].strip())
+                    # Stop once we've seen events from all phases
+                    if len(received_data) >= 3:
+                        break
+
+        async def produce_events():
+            """Push new events after a short delay, then complete the session."""
+            await asyncio.sleep(0.5)
+            # seq=2 — should arrive while stream is running
+            await storage.append_events(
+                [
+                    Event(
+                        session_id=session.id,
+                        channel="stdout",
+                        seq=2,
+                        type=EventType.STDOUT,
+                        data="live-event-1",
+                    )
+                ]
+            )
+            await asyncio.sleep(1.5)
+            # seq=3 + mark terminal
+            await storage.append_events(
+                [
+                    Event(
+                        session_id=session.id,
+                        channel="stdout",
+                        seq=3,
+                        type=EventType.STDOUT,
+                        data="live-event-2",
+                    )
+                ]
+            )
+            await storage.update_session(session.id, status=SessionStatus.COMPLETED)
+
+        # Run producer and consumer concurrently
+        await asyncio.gather(produce_events(), consume_stream())
+
+        # Verify we got all 3 events (pre-existing + 2 live)
+        assert len(received_data) >= 3
+        # Parse the JSON data payloads to check content
+        import json
+
+        payloads = [json.loads(d) for d in received_data[:3]]
+        assert payloads[0]["data"] == "pre-existing"
+        assert payloads[0]["seq"] == 1
+        assert payloads[1]["data"] == "live-event-1"
+        assert payloads[1]["seq"] == 2
+        assert payloads[2]["data"] == "live-event-2"
+        assert payloads[2]["seq"] == 3
 
 
 class TestActions:

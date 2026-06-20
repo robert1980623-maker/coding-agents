@@ -63,6 +63,10 @@ class StreamExecutor:
         self._seq = SeqCounter()
         self._buffer: list[Event] = []
         self._last_flush = time.monotonic()
+        # Monotonic timestamp of last stdout line (used by _heartbeat_writer
+        # to gate DB writes — preserves the original semantic that heartbeat
+        # only advances when there is actual stdout activity).
+        self._last_stdout_activity: float = 0.0
 
     async def execute(
         self,
