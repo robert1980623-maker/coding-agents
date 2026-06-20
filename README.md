@@ -13,6 +13,8 @@ A unified, high-performance runtime for managing coding agents (Claude Code, Cod
 - **HTTP API**: 12 REST endpoints + SSE event streaming
 - **Python SDK**: Async-only client for OpenClaw / Hermes / any async Python host
 - **OpenClaw Integration**: Example scripts + integration guide
+- **Project-local skills**: SKILL.md catalog under `.coding-agents/skills/`
+  (agentskill.io standard) discoverable by Claude Code / Codex natively
 
 ## Installation
 
@@ -134,6 +136,31 @@ Example scripts + integration guide:
 - [`openclaw_integration/examples/stream_events.py`](openclaw_integration/examples/stream_events.py)
 - [`openclaw_integration/examples/error_handling.py`](openclaw_integration/examples/error_handling.py)
 - [`openclaw_integration/docs/INTEGRATION.md`](openclaw_integration/docs/INTEGRATION.md)
+
+### Skills
+
+This repo ships a starter set of skills under `.coding-agents/skills/`
+(agentskill.io standard). They are project-local, git-tracked, and
+discoverable by Claude Code / Codex when the agent's cwd is this repo
+root. **They are not auto-injected** — each agent discovers them
+natively (see v0.2.4 release notes).
+
+| Skill | When to use |
+| --- | --- |
+| `coding-agents-dispatch` | You need to dispatch a coding-agents session for a project task |
+| `coding-agents-recovery` | A session is stuck / orphaned; you need to recover |
+| `coding-agents-cost` | You need to budget, monitor, or cap session cost |
+| `coding-agents-skills` | You need to install, update, or share a skill |
+
+Inspect with:
+
+```bash
+coding-agents skill list
+coding-agents skill show <name>
+```
+
+To add a new skill, create `.coding-agents/skills/<name>/SKILL.md` and
+commit it.
 
 ## Architecture
 

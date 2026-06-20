@@ -188,6 +188,45 @@ Before going to production:
       (see `examples/error_handling.py`)
 - [ ] OpenClaw client cancels the stream and calls `kill()` on user-cancel
 
+## 7.5. Skills (project-local knowledge)
+
+coding-agents ships a set of project-local skills under
+`../.coding-agents/skills/` (agentskill.io standard). These are
+git-tracked, version-controlled, and discoverable by Claude Code
+/ Codex when the agent's cwd is the coding-agents project root.
+
+| Skill | When to use |
+| --- | --- |
+| `coding-agents-dispatch` | Dispatching a session for a project task |
+| `coding-agents-recovery` | Recovering from a stuck / orphaned session |
+| `coding-agents-cost` | Budgeting and monitoring session cost |
+| `coding-agents-skills` | Managing the skill catalog itself |
+
+**Important**: since v0.2.4 these skills are **not** auto-injected
+into the agent's system prompt. Each agent discovers them natively
+(Claude Code reads `~/.claude/skills/`, Codex reads `AGENTS.md`).
+Forcing a skill list would compete with the agent's own discovery.
+
+### For OpenClaw integrators
+
+When OpenClaw dispatches a coding-agents session, pass `--workdir`
+pointing to the coding-agents project root (or whichever project
+you want the agent to see). The agent will then read the project's
+SKILL.md catalog on its own:
+
+```bash
+coding-agents dispatch claude "fix the auth bug" \
+  --workdir /path/to/coding-agents
+```
+
+You do **not** need to enumerate the skills in the prompt. The
+agent will use them when relevant.
+
+If you want a sub-agent to be aware of *how* to dispatch correctly,
+point it at the `coding-agents-dispatch` skill in the project, or
+include its `description` in the spawn prompt so the sub-agent
+knows to read it.
+
 ## 8. Where to go next
 
 - [SDK API reference](../../sdk/README.md)
