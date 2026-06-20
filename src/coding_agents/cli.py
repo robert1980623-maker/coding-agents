@@ -84,8 +84,51 @@ def run(
     stream: bool = typer.Option(False, "--stream", help="Stream events in real-time with annotations"),
     verbose: bool = typer.Option(False, help="Verbose output"),
 ) -> None:
-    """Run a coding agent session."""
+    """[DEPRECATED] Run a coding agent session. Use 'dispatch' instead."""
+    import warnings
+    warnings.warn(
+        "'coding-agents run' is deprecated; use 'coding-agents dispatch' instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     _run_async(_run_session(agent, prompt, workdir, model, budget, output_mode, stream, verbose))
+
+
+@app.command(name="dispatch")
+def dispatch(
+    agent: str = typer.Argument(..., help="Agent type: claude or codex"),
+    prompt: str = typer.Argument(..., help="Prompt to send to the agent"),
+    workdir: Optional[str] = typer.Option(
+        None,
+        "--workdir", "-w",
+        help="Working directory for the agent subprocess (default: current dir). "
+             "This is where the agent reads AGENTS.md / CLAUDE.md / .claude/skills/ "
+             "from, so always set this to your project root.",
+    ),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Model override"),
+    budget: Optional[float] = typer.Option(None, "--budget", "-b", help="Max budget in USD"),
+    stream: bool = typer.Option(
+        True, "--stream/--no-stream",
+        help="Stream subprocess stdout/stderr in real-time (default: on)",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+) -> None:
+    """Dispatch a coding agent session in the current project.
+
+    This is the recommended way to run an agent: the subprocess starts in
+    ``--workdir`` (default: current directory), so it sees your project's
+    AGENTS.md / CLAUDE.md / .claude/skills/ natively — no prompt injection
+    needed.
+
+    Example:
+        coding-agents dispatch claude "fix the auth bug" --workdir ~/project
+    """
+    # Default workdir to current dir (not '.') so it resolves to the absolute path
+    # the agent subprocess actually sees.
+    effective_workdir = workdir or "."
+    _run_async(
+        _run_session(agent, prompt, effective_workdir, model, budget, "standard", stream, verbose)
+    )
 
 
 async def _run_session(
