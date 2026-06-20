@@ -139,27 +139,50 @@ class TaskFlow:
         can be launched concurrently.  The first layer contains tasks with
         no dependencies; each subsequent layer only contains tasks whose
         dependencies are all in earlier layers.
+
+        Uses Kahn's algorithm with in-degree counting to compute layers in
+        a single O(V+E) pass.
         """
         if not self._tasks:
             return []
 
-        # Validate DAG (raises on cycle)
-        self.topological_sort()
+        # Validate that all dependencies reference existing tasks.
+        for tid, task in self._tasks.items():
+            for dep in task.depends_on:
+                if dep not in self._tasks:
+                    raise ValueError(
+                        f"Task {tid} depends on unknown task: {dep}"
+                    )
 
-        remaining = set(self._tasks.keys())
+        # Build adjacency list and in-degree counts.
+        in_degree: dict[str, int] = {tid: 0 for tid in self._tasks}
+        adjacency: dict[str, list[str]] = {tid: [] for tid in self._tasks}
+
+        for tid, task in self._tasks.items():
+            for dep in task.depends_on:
+                adjacency[dep].append(tid)
+                in_degree[tid] += 1
+
+        # Seed the first layer with tasks that have no dependencies.
+        current_layer = [
+            tid for tid, deg in in_degree.items() if deg == 0
+        ]
+
         layers: list[list[str]] = []
+        processed = 0
 
-        while remaining:
-            # A task is ready when all its deps are in completed layers
-            completed = set().union(*(set(layer) for layer in layers))
-            layer = [
-                tid
-                for tid in remaining
-                if all(dep in completed for dep in self._tasks[tid].depends_on)
-            ]
-            if not layer:
-                raise CyclicDependencyError("Task graph contains a cycle")
-            layers.append(layer)
-            remaining -= set(layer)
+        while current_layer:
+            layers.append(current_layer)
+            processed += len(current_layer)
+            next_layer: list[str] = []
+            for node in current_layer:
+                for neighbor in adjacency[node]:
+                    in_degree[neighbor] -= 1
+                    if in_degree[neighbor] == 0:
+                        next_layer.append(neighbor)
+            current_layer = next_layer
+
+        if processed != len(self._tasks):
+            raise CyclicDependencyError("Task graph contains a cycle")
 
         return layers

@@ -360,9 +360,37 @@ class SQLiteStorage:
         session_id: str,
         after_seq: int = 0,
     ) -> AsyncIterator[Event]:
-        events = await self.get_events(session_id, after_seq=after_seq)
-        for event in events:
-            yield event
+        """Stream events for a session, polling for new events in real-time.
+
+        For running sessions, this continuously polls for new events every second
+        until the session reaches a terminal status (COMPLETED/FAILED/KILLED/TIMEOUT/ORPHANED)
+        or the 30-minute timeout is reached.
+
+        Args:
+            session_id: The session to stream events for.
+            after_seq: Only return events with seq > this value.
+        """
+        current_seq = after_seq
+        poll_interval = 1.0  # seconds between polls
+        max_total_wait = 30 * 60  # 30 minutes
+        elapsed = 0.0
+
+        while elapsed < max_total_wait:
+            # Fetch new events since last seen seq
+            events = await self.get_events(session_id, after_seq=current_seq)
+            for event in events:
+                yield event
+                if event.seq > current_seq:
+                    current_seq = event.seq
+
+            # Check session status — stop if terminal
+            session = await self.get_session(session_id)
+            if session is None or session.status.is_terminal:
+                return
+
+            # Sleep before next poll
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
 
     async def search_events(
         self,

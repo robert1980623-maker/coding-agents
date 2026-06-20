@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, AsyncIterator, Optional
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -12,6 +14,8 @@ from coding_agents.http.auth import verify_token
 from coding_agents.http.sse import format_event_as_sse, parse_last_event_id
 from coding_agents.models import Event
 from coding_agents.storage.sqlite import SQLiteStorage
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/sessions/{session_id}/events", tags=["events"])
 
@@ -91,9 +95,21 @@ async def stream_events(
 
     async def event_generator() -> AsyncIterator[dict[str, Any]]:
         """Generate SSE events from the storage stream."""
-        async for event in storage.stream_events(session_id, after_seq=after_seq):
-            if await request.is_disconnected():
-                break
-            yield format_event_as_sse(event)
+        try:
+            async for event in storage.stream_events(session_id, after_seq=after_seq):
+                if await request.is_disconnected():
+                    break
+                yield format_event_as_sse(event)
+        except asyncio.CancelledError:
+            # Client disconnected — exit gracefully
+            logger.debug("SSE stream cancelled", session_id=session_id)
+            raise
+        except Exception:
+            logger.exception("SSE stream error", session_id=session_id)
+            # Yield an error event to the client before closing
+            yield {
+                "event": "error",
+                "data": '{"error": "internal server error"}',
+            }
 
     return EventSourceResponse(event_generator())

@@ -165,6 +165,13 @@ async def _run_single_task(
             events = await _collect()
         result.events = events
     except asyncio.TimeoutError:
+        # Kill the executor subprocess to prevent orphan processes.
+        # executor.kill() is idempotent; swallow any error so cleanup
+        # never masks the original timeout.
+        try:
+            await executor.kill()
+        except Exception:  # noqa: BLE001
+            logger.warning("executor_kill_failed", task_id=task.id, exc_info=True)
         result.status = "timeout"
         result.error = f"Task timed out after {task.timeout}s"
         result.finished_at = time.monotonic()
@@ -179,6 +186,13 @@ async def _run_single_task(
         )
         return result
     except Exception as e:
+        # Kill the executor subprocess to prevent orphan processes.
+        # executor.kill() is idempotent; swallow any error so cleanup
+        # never masks the original exception.
+        try:
+            await executor.kill()
+        except Exception:  # noqa: BLE001
+            logger.warning("executor_kill_failed", task_id=task.id, exc_info=True)
         result.status = "failed"
         result.error = str(e)
         result.finished_at = time.monotonic()

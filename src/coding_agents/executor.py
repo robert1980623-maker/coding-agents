@@ -63,7 +63,6 @@ class StreamExecutor:
         self._seq = SeqCounter()
         self._buffer: list[Event] = []
         self._last_flush = time.monotonic()
-        self._last_heartbeat_write = 0.0
 
     async def execute(
         self,
@@ -170,18 +169,19 @@ class StreamExecutor:
         # Heartbeat checker: polls DB for kill/failed signals
         heartbeat_task = asyncio.create_task(self._heartbeat_checker(session_id))
 
+        # Heartbeat writer: independent task that updates last_heartbeat_at
+        # every second. Previously embedded in stdout_reader hot path where
+        # the heavy store.update_session call (Lock + to_thread + commit)
+        # blocked stdout reads.
+        heartbeat_writer_task = asyncio.create_task(
+            self._heartbeat_writer(session_id)
+        )
+
         # stdout reader task
         async def stdout_reader() -> None:
             try:
                 assert self._process is not None and self._process.stdout is not None
                 async for line in self._process.stdout:
-                    now = time.monotonic()
-                    if now - self._last_heartbeat_write >= 1.0:
-                        await self.store.update_session(
-                            session_id, last_heartbeat_at=datetime.now(timezone.utc)
-                        )
-                        self._last_heartbeat_write = now
-
                     seq = await self._seq.next()
                     text = line.decode(errors="replace")
                     event = Event(
@@ -219,6 +219,12 @@ class StreamExecutor:
             heartbeat_task.cancel()
             try:
                 await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
+            heartbeat_writer_task.cancel()
+            try:
+                await heartbeat_writer_task
             except asyncio.CancelledError:
                 pass
 
@@ -340,6 +346,22 @@ class StreamExecutor:
         except asyncio.CancelledError:
             raise
 
+    async def _heartbeat_writer(self, session_id: str) -> None:
+        """Write last_heartbeat_at every second, independent of stdout reads.
+
+        Extracted from stdout_reader so the heavy store.update_session call
+        (asyncio.Lock + asyncio.to_thread + DB commit) does not block the
+        stdout hot path.
+        """
+        try:
+            while True:
+                await asyncio.sleep(1)
+                await self.store.update_session(
+                    session_id, last_heartbeat_at=datetime.now(timezone.utc)
+                )
+        except asyncio.CancelledError:
+            raise
+
     async def _terminate_process(self) -> None:
         """Gracefully terminate the subprocess: SIGTERM, wait 5s, then SIGKILL."""
         if self._process is None or self._process.returncode is not None:
@@ -389,12 +411,22 @@ class StreamExecutor:
 
         P1-NEW-1: atomically swaps the buffer to avoid concurrent drops
         when stdout/stderr both append during the await on store.append_events.
+        On append failure, events are best-effort re-prepended so a later
+        flush can retry instead of silently losing them.
         """
         if not self._buffer:
             return
         events, self._buffer = self._buffer, []
         self._last_flush = time.monotonic()
-        await self.store.append_events(events)
+        try:
+            await self.store.append_events(events)
+        except Exception:
+            logger.exception(
+                "flush_append_failed",
+                event_count=len(events),
+            )
+            # Best-effort retry: put events back at the head of the buffer
+            self._buffer = events + self._buffer
 
     async def _check_watch_patterns(self, session_id: str, event: Event) -> None:
         """Check watch patterns and act on matches."""
