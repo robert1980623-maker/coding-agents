@@ -484,17 +484,18 @@ class StreamExecutor:
     def _extract_text(self, line: str, output_mode: str) -> Optional[str]:
         """Extract text content for standard mode; pass-through otherwise.
 
-        v0.2.18: smart filtering for noise reduction. Returns ``None`` when
+        v0.2.20: smart filtering for noise reduction. Returns ``None`` when
         the event should be dropped entirely (not stored in SQLite). This
         keeps the SQLite event stream focused on analytically-useful data:
 
-        - ``thinking_tokens`` events (per-delta thinking metadata) are
-          dropped — token totals are tracked at the session level.
-        - ``tool_result`` events (potentially large tool return values,
-          including images/file contents) are replaced with a JSON summary
-          containing ``tool``, ``status``, ``size_bytes``, and a short
+        - ``thinking_tokens`` events (``{"type":"system","subtype":
+          "thinking_tokens",...}``) are dropped — token totals are tracked
+          at the session level.
+        - ``tool_result`` events (``{"type":"user","message":{"content":
+          [{"type":"tool_result",...}]}}``) are replaced with a JSON summary
+          containing ``tool_use_id``, ``status``, ``size_bytes``, and a short
           ``preview``.
-        - ``assistant`` text, ``result``, and ``system`` events are
+        - ``assistant`` text, ``result``, and other ``system`` events are
           preserved unchanged.
         """
         if output_mode == "passthrough":
@@ -507,9 +508,11 @@ class StreamExecutor:
 
         event_type = event.get("type")
 
-        # v0.2.18: drop thinking_tokens events — pure noise in the event
-        # stream. Token usage is already tracked per-session.
-        if event_type == "thinking_tokens":
+        # v0.2.18 → v0.2.20: drop thinking_tokens events — pure noise in
+        # the event stream. Claude Code emits them as:
+        #   {"type": "system", "subtype": "thinking_tokens", ...}
+        # Token usage is already tracked per-session.
+        if event_type == "system" and event.get("subtype") == "thinking_tokens":
             return None
 
         # Claude Code: assistant.message.content[0].text
@@ -519,13 +522,23 @@ class StreamExecutor:
                 text = content[0].get("text", "")
                 return str(text) if text else ""
 
-        # v0.2.18: summarize tool_result events. Full tool return values
-        # (often multi-KB file contents or base64-encoded images) are noise
-        # for session analysis; a compact summary preserves the useful
-        # metadata (tool name, success status, payload size) plus a short
-        # preview of the content for quick inspection.
-        if event_type == "tool_result":
-            return self._summarize_tool_result(event)
+        # v0.2.18 → v0.2.20: summarize tool_result events. Claude Code
+        # nests tool_result content blocks inside user messages:
+        #   {"type": "user", "message": {"content": [
+        #       {"type": "tool_result", "tool_use_id": "...", "content": ...}
+        #   ]}}
+        # Full tool return values (often multi-KB file contents or
+        # base64-encoded images) are noise for session analysis; a compact
+        # summary preserves the useful metadata (tool name, success status,
+        # payload size) plus a short preview of the content.
+        if event_type == "user":
+            content_blocks = event.get("message", {}).get("content", [])
+            if (
+                isinstance(content_blocks, list)
+                and content_blocks
+                and content_blocks[0].get("type") == "tool_result"
+            ):
+                return self._summarize_tool_result(content_blocks[0])
 
         # Codex: item.text
         if event_type == "item.completed":
@@ -545,7 +558,7 @@ class StreamExecutor:
         replaces the full event data in storage.
         """
         tool_use_id = event.get("tool_use_id", "")
-        content = event.get("content", "")
+        content = event.get("content")
 
         # Determine if the result is an error. Claude tool_result events
         # carry ``is_error: true`` for failed tool invocations.
@@ -554,7 +567,11 @@ class StreamExecutor:
 
         # Measure raw content size. Content may be a string or a list of
         # content blocks (text/image); stringify the latter for size.
-        if isinstance(content, str):
+        # v0.2.20: None/empty content → 0 bytes (not 4 for "null").
+        if content is None or content == "":
+            size_bytes = 0
+            preview = ""
+        elif isinstance(content, str):
             size_bytes = len(content.encode("utf-8", errors="replace"))
             preview = content[: self._TOOL_RESULT_PREVIEW_LIMIT]
             if len(content) > self._TOOL_RESULT_PREVIEW_LIMIT:
