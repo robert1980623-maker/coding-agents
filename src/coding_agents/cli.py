@@ -295,7 +295,16 @@ def bg_runner(
     budget_val = float(budget) if budget else None
     model_val = model or None
     _run_async(
-        _run_session(agent_name, _read_prompt(session_id), workdir, model_val, budget_val, "standard", False)
+        _run_session(
+            agent_name,
+            _read_prompt(session_id),
+            workdir,
+            model_val,
+            budget_val,
+            "standard",
+            False,
+            existing_session_id=session_id,
+        )
     )
 
 
@@ -322,6 +331,7 @@ async def _run_session(
     budget: Optional[float],
     output_mode: str,
     verbose: bool,
+    existing_session_id: Optional[str] = None,
 ) -> None:
     """Run the agent subprocess and persist events to SQLite.
 
@@ -358,8 +368,21 @@ async def _run_session(
     storage = _get_storage()
     await storage.initialize()
 
-    session = Session(agent=agent_type, prompt=prompt, workdir=workdir, model=model)
-    await storage.create_session(session)
+    # v0.2.18: If dispatch-bg pre-created the session, reuse the id.
+    # Without this, the runner creates a duplicate row that hits the
+    # sessions.id PRIMARY KEY constraint, throws, and exits without
+    # finalising the pre-existing session (status stays "pending"
+    # forever even though the agent subprocess is still running).
+    if existing_session_id is not None:
+        existing = await storage.get_session(existing_session_id)
+        if existing is None:
+            raise RuntimeError(
+                f"dispatch-bg session {existing_session_id} not found"
+            )
+        session = existing
+    else:
+        session = Session(agent=agent_type, prompt=prompt, workdir=workdir, model=model)
+        await storage.create_session(session)
     # Always print the session id early so the caller can poll status
     # / tail even if dispatch is killed by the 1MB buffer.
     console.print(f"session_id={session.id}")

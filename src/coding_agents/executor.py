@@ -188,14 +188,21 @@ class StreamExecutor:
                 assert self._process is not None and self._process.stdout is not None
                 async for line in self._process.stdout:
                     self._last_stdout_activity = time.monotonic()
-                    seq = await self._seq.next()
                     text = line.decode(errors="replace")
+                    # v0.2.18: _extract_text returns None for events that
+                    # should be filtered out of storage entirely (e.g.
+                    # thinking_tokens). Skip event creation for those so
+                    # they don't consume a seq number or a DB row.
+                    data = self._extract_text(text, self.config.output_mode)
+                    if data is None:
+                        continue
+                    seq = await self._seq.next()
                     event = Event(
                         session_id=session_id,
                         channel="stdout",
                         seq=seq,
                         type=EventType.STDOUT,
-                        data=self._extract_text(text, self.config.output_mode),
+                        data=data,
                         raw_json=text if self.config.output_mode == "passthrough" else None,
                     )
                     self._buffer.append(event)
@@ -471,8 +478,25 @@ class StreamExecutor:
             except (ProcessLookupError, PermissionError):
                 pass
 
-    def _extract_text(self, line: str, output_mode: str) -> str:
-        """Extract text content for standard mode; pass-through otherwise."""
+    # v0.2.18: tool_result preview cutoff (bytes).
+    _TOOL_RESULT_PREVIEW_LIMIT: int = 200
+
+    def _extract_text(self, line: str, output_mode: str) -> Optional[str]:
+        """Extract text content for standard mode; pass-through otherwise.
+
+        v0.2.18: smart filtering for noise reduction. Returns ``None`` when
+        the event should be dropped entirely (not stored in SQLite). This
+        keeps the SQLite event stream focused on analytically-useful data:
+
+        - ``thinking_tokens`` events (per-delta thinking metadata) are
+          dropped — token totals are tracked at the session level.
+        - ``tool_result`` events (potentially large tool return values,
+          including images/file contents) are replaced with a JSON summary
+          containing ``tool``, ``status``, ``size_bytes``, and a short
+          ``preview``.
+        - ``assistant`` text, ``result``, and ``system`` events are
+          preserved unchanged.
+        """
         if output_mode == "passthrough":
             return line
 
@@ -481,19 +505,74 @@ class StreamExecutor:
         except (json.JSONDecodeError, ValueError):
             return line
 
+        event_type = event.get("type")
+
+        # v0.2.18: drop thinking_tokens events — pure noise in the event
+        # stream. Token usage is already tracked per-session.
+        if event_type == "thinking_tokens":
+            return None
+
         # Claude Code: assistant.message.content[0].text
-        if event.get("type") == "assistant":
+        if event_type == "assistant":
             content = event.get("message", {}).get("content", [])
             if content and content[0].get("type") == "text":
                 text = content[0].get("text", "")
                 return str(text) if text else ""
+
+        # v0.2.18: summarize tool_result events. Full tool return values
+        # (often multi-KB file contents or base64-encoded images) are noise
+        # for session analysis; a compact summary preserves the useful
+        # metadata (tool name, success status, payload size) plus a short
+        # preview of the content for quick inspection.
+        if event_type == "tool_result":
+            return self._summarize_tool_result(event)
+
         # Codex: item.text
-        if event.get("type") == "item.completed":
+        if event_type == "item.completed":
             item = event.get("item", {})
             if item.get("type") == "agent_message":
                 text = item.get("text", "")
                 return str(text) if text else ""
+
         return line
+
+    def _summarize_tool_result(self, event: dict) -> str:
+        """Build a compact JSON summary for a ``tool_result`` event.
+
+        Extracts the tool use id, success/error status, payload size in
+        bytes, and the first ``_TOOL_RESULT_PREVIEW_LIMIT`` characters of
+        content (if available and text-based). Returns a JSON string that
+        replaces the full event data in storage.
+        """
+        tool_use_id = event.get("tool_use_id", "")
+        content = event.get("content", "")
+
+        # Determine if the result is an error. Claude tool_result events
+        # carry ``is_error: true`` for failed tool invocations.
+        is_error = event.get("is_error", False)
+        status = "error" if is_error else "ok"
+
+        # Measure raw content size. Content may be a string or a list of
+        # content blocks (text/image); stringify the latter for size.
+        if isinstance(content, str):
+            size_bytes = len(content.encode("utf-8", errors="replace"))
+            preview = content[: self._TOOL_RESULT_PREVIEW_LIMIT]
+            if len(content) > self._TOOL_RESULT_PREVIEW_LIMIT:
+                preview += "..."
+        else:
+            # Non-string content (e.g. image blocks) — serialize for size
+            # but don't try to produce a readable preview.
+            serialized = json.dumps(content)
+            size_bytes = len(serialized.encode("utf-8", errors="replace"))
+            preview = ""
+
+        summary = {
+            "tool_use_id": tool_use_id,
+            "status": status,
+            "size_bytes": size_bytes,
+            "preview": preview,
+        }
+        return json.dumps(summary)
 
     async def _flush_if_needed(self) -> None:
         """Flush buffer when it reaches 100 items or 100ms has elapsed."""
