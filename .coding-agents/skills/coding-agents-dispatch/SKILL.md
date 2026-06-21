@@ -216,3 +216,53 @@ batch_download_enhanced.py 用 subprocess.run 下载每只股票 (200 次进程�
 | 1-3 KB | OK for complex multi-file work |
 | 3-6 KB | Suspicious — re-check if you can cut |
 | > 6 KB | Almost certainly too much — split into multiple dispatches |
+
+---
+
+## v0.2.17+: `dispatch-bg` for fire-and-forget dispatch
+
+**Use `dispatch-bg` instead of `dispatch` when calling from inside an agent / cron / orchestrator.**
+
+Why: OpenClaw's `exec` tool has a `tools.exec.timeoutSec: 30` default. A long-running agent task
+dispatched via plain `dispatch` gets killed after 30s (exit_code=-1, metadata=`wrapper terminated`).
+The agent subprocess may still complete in the background, but you can't reliably wait for it
+from inside a 30s exec call.
+
+`dispatch-bg` solves this:
+
+- Returns session_id within ~1 second (way under the 30s timeout)
+- Spawns a detached runner subprocess (`start_new_session=True`) that owns the agent subprocess
+- The dispatch wrapper exits immediately; the runner runs independently
+- All events still go to SQLite — query with `status <id>` / `tail <id>`
+
+### When to use which
+
+| Scenario | Use |
+| --- | --- |
+| Human runs from a long-lived terminal | `dispatch` (blocking, get result inline) |
+| Agent / cron / orchestrator calls | **`dispatch-bg`** (fire-and-forget) |
+| You need a result NOW and the task is < 30s | `dispatch` (with short prompt) |
+
+### `dispatch-bg` usage
+
+```bash
+# Returns within ~1s with session_id
+coding-agents dispatch-bg claude "<prompt>" --workdir /path/to/project
+
+# Output (always 2 lines, < 1KB):
+session_id=<uuid>
+{"session_id": "...", "status": "running"}
+
+# Then poll progress
+coding-agents status <id>
+coding-agents tail <id> --limit 20
+```
+
+### Why both commands still exist
+
+- `dispatch` — back-compat with v0.2.6+ semantics; safe for human-driven terminal use
+- `dispatch-bg` — new in v0.2.17; safe for agent/orchestrator use
+
+The CLI wrapper that runs `dispatch-bg` exits before any agent work begins, so the OpenClaw 30s
+timeout never sees the long-running agent process.
+

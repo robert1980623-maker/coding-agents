@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import signal
+import subprocess
 import sys
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -147,6 +149,169 @@ def dispatch(
     _run_async(
         _run_session(agent, prompt, effective_workdir, model, budget, "standard", verbose)
     )
+
+
+# === v0.2.17: fire-and-forget dispatch (solves OpenClaw 30s exec timeout) ===
+
+@app.command(name="dispatch-bg")
+def dispatch_bg(
+    agent: str = typer.Argument(..., help="Agent type: claude or codex"),
+    prompt: str = typer.Argument(..., help="Prompt to send to the agent"),
+    workdir: Optional[str] = typer.Option(
+        None,
+        "--workdir", "-w",
+        help="Working directory for the agent subprocess (default: current dir).",
+    ),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Model override"),
+    budget: Optional[float] = typer.Option(None, "--budget", "-b", help="Max budget in USD"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+) -> None:
+    """Dispatch a coding agent in fire-and-forget mode.
+
+    Unlike ``dispatch``, this command returns the session_id within ~1 second
+    and exits immediately. The actual agent execution runs in a detached
+    subprocess that is independent of the dispatch wrapper's lifetime.
+
+    Why this exists: OpenClaw's exec tool has a 30s timeout. Calling
+    ``dispatch`` from a long-running agent would kill the wrapper before the
+    agent finishes. ``dispatch-bg`` solves this by returning immediately;
+    the caller polls ``status <id>`` / ``tail <id>`` to inspect progress.
+
+    Output (always 2 lines, < 1KB):
+        session_id=<uuid>
+        {"session_id": "...", "status": "running"}
+    """
+    effective_workdir = workdir or "."
+    _run_async(
+        _dispatch_bg_setup(agent, prompt, effective_workdir, model, budget, verbose)
+    )
+
+
+async def _dispatch_bg_setup(
+    agent_name: str,
+    prompt: str,
+    workdir: str,
+    model: Optional[str],
+    budget: Optional[float],
+    verbose: bool,
+) -> None:
+    """Set up a session and spawn a detached runner subprocess.
+
+    The runner subprocess (coding-agents _bg-runner) takes over the
+    execution lifecycle independently of this wrapper's lifetime. When this
+    wrapper exits, the runner continues running in its own process group.
+    """
+    try:
+        agent_type = AgentType(agent_name)
+    except ValueError:
+        console.print(f"[red]Unknown agent type: {agent_name}[/red]")
+        raise typer.Exit(code=1)
+
+    storage = _get_storage()
+    await storage.initialize()
+    try:
+        session = Session(
+            agent=agent_type, prompt=prompt, workdir=workdir, model=model
+        )
+        await storage.create_session(session)
+    finally:
+        await storage.close()
+
+    # Print session_id early so the caller always has it, even if spawn fails.
+    console.print(f"session_id={session.id}")
+
+    # Spawn the runner in a fully detached subprocess. close_fds=True +
+    # start_new_session=True gives the runner its own session/process group,
+    # so even SIGHUP/SIGTERM to this wrapper doesn't propagate to the agent.
+    # Use the `coding-agents` CLI wrapper (not `python -m coding_agents`)
+    # because the package has no __main__.py.
+    runner_argv = [
+        "coding-agents", "_bg-runner",
+        session.id,
+        agent_name,
+        workdir,
+        model or "",
+        str(budget) if budget is not None else "",
+    ]
+    if verbose:
+        console.print(f"[dim]spawning runner: {' '.join(runner_argv)}[/dim]")
+    try:
+        proc = subprocess.Popen(
+            runner_argv,
+            start_new_session=True,
+            close_fds=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={**os.environ, "CODING_AGENTS_BG_RUNNER": "1"},
+        )
+        if verbose:
+            console.print(f"[dim]runner PID: {proc.pid}[/dim]")
+    except Exception as e:
+        # Spawn failed; mark session failed before exiting.
+        storage = _get_storage()
+        await storage.initialize()
+        try:
+            await storage.update_session(
+                session.id,
+                status=SessionStatus.FAILED,
+                finished_at=datetime.now(timezone.utc),
+                metadata={"error": f"bg-runner spawn failed: {e}"},
+            )
+        finally:
+            await storage.close()
+        console.print(json.dumps({
+            "session_id": session.id,
+            "status": "spawn_failed",
+            "error": str(e),
+        }))
+        raise typer.Exit(code=1)
+
+    # Bound the wrapper output: a single JSON line summarising the dispatch.
+    sys.stdout.write(json.dumps({
+        "session_id": session.id,
+        "status": "running",
+    }) + "\n")
+    sys.stdout.flush()
+
+
+@app.command(name="_bg-runner", hidden=True)
+def bg_runner(
+    session_id: str = typer.Argument(..., help="Session id to resume"),
+    agent_name: str = typer.Argument(..., help="Agent type: claude or codex"),
+    workdir: str = typer.Argument(..., help="Working directory"),
+    model: str = typer.Argument("", help="Model override (empty = none)"),
+    budget: str = typer.Argument("", help="Max budget (empty = none)"),
+) -> None:
+    """Internal: detached runner that executes a session.
+
+    Spawned by ``dispatch-bg``. Runs independently of the dispatch wrapper,
+    so the agent subprocess continues even if the wrapper is killed by
+    OpenClaw's 30s exec timeout.
+
+    Use ``coding-agents status <id>`` or ``coding-agents tail <id>`` to
+    inspect progress — do not call this directly.
+    """
+    budget_val = float(budget) if budget else None
+    model_val = model or None
+    _run_async(
+        _run_session(agent_name, _read_prompt(session_id), workdir, model_val, budget_val, "standard", False)
+    )
+
+
+def _read_prompt(session_id: str) -> str:
+    """Read the prompt from the persisted session record (sync helper for bg runner)."""
+    import sqlite3
+    db_path = os.environ.get("CODING_AGENTS_DB", DEFAULT_DB)
+    db_path = os.path.expanduser(db_path)
+    try:
+        with sqlite3.connect(db_path, timeout=5) as conn:
+            row = conn.execute("SELECT prompt FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            if row is None:
+                raise RuntimeError(f"Session not found: {session_id}")
+            return row[0]
+    except Exception as e:
+        raise RuntimeError(f"Failed to read session prompt: {e}")
 
 
 async def _run_session(

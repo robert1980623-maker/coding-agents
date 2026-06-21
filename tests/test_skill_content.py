@@ -149,3 +149,29 @@ class TestDispatchSkillTeachesShortPrompts:
                "完整代码" in text, (
             "Dispatch skill must warn against complete code templates"
         )
+
+
+# === v0.2.17: dispatch-bg guidance ===
+
+class TestDispatchSkillTeachesDispatchBg:
+    """The dispatch skill must teach agents to use dispatch-bg from orchestrators."""
+
+    def test_dispatch_bg_section_present(self):
+        text = _read(DISPATCH_SKILL)
+        assert "dispatch-bg" in text, "Skill must mention dispatch-bg command"
+
+    def test_30s_timeout_explained(self):
+        text = _read(DISPATCH_SKILL)
+        assert "30" in text and ("timeout" in text.lower() or "OpenClaw" in text), (
+            "Skill must explain the OpenClaw 30s exec timeout"
+        )
+
+    def test_fire_and_forget_explained(self):
+        text = _read(DISPATCH_SKILL)
+        assert "fire-and-forget" in text.lower() or "background" in text.lower(), (
+            "Skill must explain fire-and-forget mode"
+        )
+
+    def test_dispatch_bg_example(self):
+        text = _read(DISPATCH_SKILL)
+        assert "coding-agents dispatch-bg" in text, "Skill must show dispatch-bg example"
