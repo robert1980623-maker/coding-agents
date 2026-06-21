@@ -245,6 +245,77 @@ class SQLiteStorage:
         rows = await asyncio.to_thread(cursor.fetchall)
         return [self._row_to_session(r) for r in rows]
 
+    async def poll_summary(
+        self,
+        statuses: Optional[list[str]] = None,
+        limit: int = 20,
+    ) -> list[tuple[Session, Optional[dict[str, Any]]]]:
+        """Return sessions + their latest event in a single query.
+
+        Used by ``coding-agents poll`` to avoid N+1 event lookups. Each
+        tuple is ``(session, last_event_info)`` where *last_event_info*
+        is ``None`` when the session has no events, or a dict with keys
+        ``type`` (str), ``seq`` (int), ``data_bytes`` (int) when present.
+
+        Args:
+            statuses: whitelist of status values (e.g. ``['running', 'pending']``).
+                ``None`` means no status filter.
+            limit: max sessions to return, ordered by ``created_at DESC``.
+        """
+        conn = await self._get_conn()
+        conditions: list[str] = []
+        params: list[Any] = []
+
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            conditions.append(f"s.status IN ({placeholders})")  # nosec B608
+            params.extend(statuses)
+
+        where = ""
+        if conditions:
+            where = "WHERE " + " AND ".join(conditions)
+
+        # LEFT JOIN with the latest event per session (by max seq).
+        # s.* is unambiguous because we prefix with the sessions alias;
+        # the three event columns are explicitly namespaced with e.*.
+        sql = f"""
+            SELECT s.*, e.type AS ev_type, e.seq AS ev_seq,
+                   length(e.data) AS ev_data_bytes
+            FROM sessions s
+            LEFT JOIN (
+                SELECT session_id, type, seq, data
+                FROM events
+                WHERE (session_id, seq) IN (
+                    SELECT session_id, MAX(seq)
+                    FROM events
+                    GROUP BY session_id
+                )
+            ) e ON e.session_id = s.id
+            {where}
+            ORDER BY s.created_at DESC
+            LIMIT ?
+        """  # nosec B608
+        params.append(limit)
+
+        cursor = await asyncio.to_thread(conn.execute, sql, params)
+        rows = await asyncio.to_thread(cursor.fetchall)
+
+        results: list[tuple[Session, Optional[dict[str, Any]]]] = []
+        for row in rows:
+            session = self._row_to_session(row)
+            d = dict(row)
+            ev_type = d.get("ev_type")
+            if ev_type is not None:
+                last_event = {
+                    "type": ev_type,
+                    "seq": d.get("ev_seq", 0),
+                    "data_bytes": d.get("ev_data_bytes") or 0,
+                }
+            else:
+                last_event = None
+            results.append((session, last_event))
+        return results
+
     def _row_to_session(self, row: sqlite3.Row) -> Session:
         d = dict(row)
         agent_str = d["agent"]

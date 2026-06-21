@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -768,6 +769,225 @@ async def _list_sessions(
         sys.stdout.flush()
     finally:
         await storage.close()
+
+
+@app.command()
+def poll(
+    all: bool = typer.Option(
+        False, "--all",
+        help="Include all sessions, not just active (running/pending).",
+    ),
+    status: Optional[str] = typer.Option(
+        None, "--status", "-s",
+        help="Filter by status (running/completed/failed). "
+             "Overrides the default active-only filter.",
+    ),
+    stuck_after: str = typer.Option(
+        "30m", "--stuck-after",
+        help="Mark sessions stuck if no event for this duration "
+             "(default: 30m). Accepts: 30m, 1h, 1h30m, or raw seconds.",
+    ),
+    format: str = typer.Option(
+        "table", "--format", "-f",
+        help="Output format: table (default) or json.",
+    ),
+    limit: int = typer.Option(20, "--limit", "-n", help="Max sessions to show."),
+) -> None:
+    """Poll all active sessions — one-line status overview per session.
+
+    Shows which sessions are running, what they last did (event type),
+    how long they've been running, and whether they appear stuck
+    (no heartbeat for --stuck-after). Designed for the PM agent to
+    check fleet health with a single command instead of N list+tail calls.
+    """
+    _run_async(_poll_sessions(all, status, stuck_after, format, limit))
+
+
+async def _poll_sessions(
+    include_all: bool,
+    status_filter: Optional[str],
+    stuck_after_str: str,
+    format_str: str,
+    limit: int,
+) -> None:
+    stuck_after_secs = _parse_duration(stuck_after_str)
+    now = datetime.now(timezone.utc)
+
+    storage = _get_storage()
+    await storage.initialize()
+    try:
+        # Resolve status filter.
+        # Explicit --status wins; then --all; default = active only.
+        if status_filter:
+            statuses = [status_filter]
+        elif include_all:
+            statuses = None  # no filter
+        else:
+            statuses = ["running", "pending"]
+
+        raw = await storage.poll_summary(statuses=statuses, limit=limit)
+
+        # Build result dicts.
+        results: list[dict[str, Any]] = []
+        for session, last_event in raw:
+            started_ts = (
+                session.started_at.timestamp() if session.started_at else None
+            )
+            running_for_ms: Optional[int] = None
+            if started_ts is not None:
+                running_for_ms = int(
+                    (now.timestamp() - started_ts) * 1000
+                )
+
+            # Stuck: only for non-terminal sessions with a known reference time.
+            stuck = False
+            if not session.status.is_terminal:
+                ref_ts = (
+                    session.last_heartbeat_at.timestamp()
+                    if session.last_heartbeat_at
+                    else (
+                        session.started_at.timestamp()
+                        if session.started_at
+                        else (
+                            session.created_at.timestamp()
+                            if session.created_at
+                            else None
+                        )
+                    )
+                )
+                if ref_ts is not None:
+                    stuck = (now.timestamp() - ref_ts) > stuck_after_secs
+
+            entry: dict[str, Any] = {
+                "id": session.id,
+                "agent": session.agent.value,
+                "status": session.status.value,
+                "started_at": (
+                    session.started_at.isoformat()
+                    if session.started_at else None
+                ),
+                "running_for_ms": running_for_ms,
+                "last_event": last_event,
+                "stuck": stuck,
+            }
+            results.append(entry)
+
+        if format_str == "json":
+            summary = {
+                "total": len(results),
+                "running": sum(
+                    1 for r in results if r["status"] == "running"
+                ),
+                "pending": sum(
+                    1 for r in results if r["status"] == "pending"
+                ),
+                "completed": sum(
+                    1 for r in results if r["status"] == "completed"
+                ),
+                "failed": sum(
+                    1 for r in results if r["status"] == "failed"
+                ),
+                "stuck": sum(1 for r in results if r["stuck"]),
+            }
+            sys.stdout.write(
+                json.dumps(
+                    {"sessions": results, "summary": summary},
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+            sys.stdout.flush()
+            return
+
+        # Table output.
+        if not results:
+            console.print("[dim]No matching sessions.[/dim]")
+            return
+
+        import io
+        _buf = io.StringIO()
+        _wide = Console(file=_buf, width=160, force_terminal=False)
+        table = Table(title="Session Poll")
+        table.add_column("Session ID", style="cyan", no_wrap=True)
+        table.add_column("Agent", style="magenta")
+        table.add_column("Status", style="green")
+        table.add_column("Running", justify="right")
+        table.add_column("Last Event")
+        table.add_column("Stuck?", justify="center")
+
+        for r in results:
+            running = (
+                _format_duration(r["running_for_ms"] / 1000)
+                if r["running_for_ms"] is not None
+                else "-"
+            )
+            last_ev = (
+                r["last_event"]["type"] if r["last_event"] else "-"
+            )
+            if r["status"] in ("running", "pending"):
+                stuck_str = (
+                    "[red]⚠️ STUCK[/red]" if r["stuck"] else "no"
+                )
+            else:
+                stuck_str = "-"
+
+            table.add_row(
+                r["id"],
+                r["agent"],
+                r["status"],
+                running,
+                last_ev,
+                stuck_str,
+            )
+
+        _wide.print(table)
+        sys.stdout.write(_buf.getvalue())
+        sys.stdout.flush()
+    finally:
+        await storage.close()
+
+
+def _format_duration(seconds: float) -> str:
+    """Format seconds as a human-readable duration: 5m, 4m21s, 2h30m, 45s."""
+    if seconds < 0:
+        return "-"
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+    if minutes < 60:
+        return f"{minutes}m{secs:02d}s" if secs else f"{minutes}m"
+    hours = minutes // 60
+    mins = minutes % 60
+    return f"{hours}h{mins:02d}m" if mins else f"{hours}h"
+
+
+def _parse_duration(s: str) -> int:
+    """Parse a duration string into seconds.
+
+    Accepts: ``30m``, ``1h``, ``1h30m``, ``90s``, or raw integer seconds.
+    """
+    s = s.strip().lower()
+    total = 0
+    # Hours
+    h_match = re.search(r"(\d+)h", s)
+    if h_match:
+        total += int(h_match.group(1)) * 3600
+    # Minutes
+    m_match = re.search(r"(\d+)m", s)
+    if m_match:
+        total += int(m_match.group(1)) * 60
+    # Seconds (only if explicit 's' suffix)
+    s_match = re.search(r"(\d+)s", s)
+    if s_match:
+        total += int(s_match.group(1))
+    # Bare number = seconds
+    if not (h_match or m_match or s_match):
+        try:
+            total = int(s)
+        except ValueError:
+            total = 1800  # fallback: 30m
+    return total
 
 
 @app.command()
