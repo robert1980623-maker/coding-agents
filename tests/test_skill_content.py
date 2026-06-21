@@ -117,3 +117,35 @@ class TestSkillsAreConsistent:
             "Cost skill must acknowledge the dispatch skill's no-budget default"
         )
         assert "Default: dispatch without model or budget" in dispatch
+
+
+# === prompt-size guidance ===
+
+class TestDispatchSkillTeachesShortPrompts:
+    """The dispatch skill must teach PMs to write short prompts."""
+
+    def test_prompt_guidance_section_present(self):
+        text = _read(DISPATCH_SKILL)
+        assert "Keep prompts short" in text or "prompts short" in text.lower()
+
+    def test_size_guideline_present(self):
+        text = _read(DISPATCH_SKILL)
+        assert "> 6 KB" in text or "6 KB" in text, (
+            "Dispatch skill must include a size guideline"
+        )
+
+    def test_bad_prompt_example_present(self):
+        text = _read(DISPATCH_SKILL)
+        assert "Bad prompt" in text or "do not do this" in text.lower()
+
+    def test_good_prompt_example_present(self):
+        text = _read(DISPATCH_SKILL)
+        assert "Good prompt" in text or "do this" in text.lower()
+
+    def test_excludes_code_templates(self):
+        text = _read(DISPATCH_SKILL)
+        # Should warn against complete code templates
+        assert "code templates" in text.lower() or "代码模板" in text or \
+               "完整代码" in text, (
+            "Dispatch skill must warn against complete code templates"
+        )

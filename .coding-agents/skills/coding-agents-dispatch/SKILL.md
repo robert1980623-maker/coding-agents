@@ -135,3 +135,84 @@ coding-agents tail $SID --limit 500  # bigger window
 - `coding-agents-recovery` — how to recover from crashes / orphans
 - `coding-agents-cost` — how to estimate and cap costs
 - `coding-agents-skills` — how to manage skill directories (CLI)
+## Keep prompts short — describe problems, not solutions
+
+A good dispatch prompt is **a problem statement and acceptance criteria**,
+not a full implementation blueprint. Concretely:
+
+- ✅ Include: background / root cause, goal, constraints, workdir, agent type,
+  acceptance criteria (what counts as "done").
+- ❌ Exclude: complete code templates, function signatures, exact commit
+  message text, step-by-step rewrites of files the agent hasn't read yet.
+
+Why this matters:
+
+- Long prompts eat the agent's context window. A 10 KB prompt can push
+  the agent's first-turn context close to its limit, making later
+  tool calls (which append to context) fail.
+- Agents design better code than copy-pasted templates. They're trained
+  on patterns, not the specific code you have in mind.
+- The PM is the wrong layer to design the implementation. PM designs
+  the goal and constraints; the agent picks the implementation.
+- Commit messages, notification routes, and verification commands are
+  conventions the agent already knows (from `AGENTS.md` / `CLAUDE.md` /
+  skills) — they don't belong in the dispatch prompt.
+
+### Bad prompt (do not do this)
+
+```markdown
+# VNPY Phase 2: 统一 DataDownloader + 并发下载
+
+### Task 1: 创建统一 DataDownloader 类
+新建 `examples/alpha_research/data_downloader.py`：
+```python
+[150 行完整代码，含 dataclass / ThreadPoolExecutor / 失败队列]
+```
+
+### Task 2: 重构 batch_download_enhanced.py
+1. 在文件顶部 `from data_downloader import DataDownloader, ...`
+2. 删除 `download_with_tushare()` 和 `download_with_akshare()` 中的 subprocess.run
+3. 改为：
+```python
+def download_with_tushare(stock_code):
+    """使用 Tushare Pro 下载（进程内调用）"""
+    from download_data_akshare import get_stock_bars_tushare
+    df = get_stock_bars_tushare(...)
+    ...
+```
+```
+
+(~11.5 KB, includes code, function signatures, verification commands,
+commit message, notification routing — way too much.)
+
+### Good prompt (do this)
+
+```markdown
+# VNPY Phase 2: 统一 DataDownloader + 并发下载
+
+## 问题
+batch_download_enhanced.py 用 subprocess.run 下载每只股票 (200 次进程启动浪费)
+
+## 目标
+1. 创建 data_downloader.py 提供 DataDownloader 类（直接 import download_data_akshare 的函数，不开子进程）
+2. 重构 batch_download_enhanced.py 用 DataDownloader（保留命令行接口）
+3. 验证 import 成功 + py_compile 通过
+4. commit（不 push）
+
+## 约束
+- workdir: /Users/rowang/projects/vnpy
+- 不修改 download_data_akshare.py
+
+读完 AGENTS.md / CLAUDE.md 后再开始。
+```
+
+(~500 B, just problem + goal + constraints + acceptance criteria.)
+
+### Size guideline
+
+| Prompt length | Verdict |
+| --- | --- |
+| < 1 KB | Ideal |
+| 1-3 KB | OK for complex multi-file work |
+| 3-6 KB | Suspicious — re-check if you can cut |
+| > 6 KB | Almost certainly too much — split into multiple dispatches |
