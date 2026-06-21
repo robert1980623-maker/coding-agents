@@ -25,3 +25,12 @@ class BaseAgent(ABC):
     def extract_cost(self, output: str) -> Optional[float]:
         """Extract cost information from accumulated output."""
         ...
+
+    def env_overrides(self) -> dict[str, str]:
+        """Return environment variable overrides for the agent subprocess.
+
+        Subclasses override this to fix environment issues (e.g. HOME
+        redirection by host processes like Hermes profiles). Default: no
+        overrides.
+        """
+        return {}

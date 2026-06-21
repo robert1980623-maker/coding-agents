@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import pwd
 from typing import Any, Optional
 
 import structlog
@@ -11,6 +13,20 @@ from coding_agents.agents.base import BaseAgent
 from coding_agents.models import ExecutionConfig
 
 logger = structlog.get_logger(__name__)
+
+
+def _get_real_home() -> str:
+    """Resolve the real user home directory.
+
+    When the parent process redirects HOME (e.g. Hermes profiles set
+    HOME=~/.hermes/profiles/<name>/home), Codex fails to find its config
+    at ~/.codex/config.toml. We resolve the real home via pwd database
+    which is immune to HOME overrides.
+    """
+    try:
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except (KeyError, AttributeError):
+        return os.path.expanduser("~")
 
 
 class CodexAgent(BaseAgent):
@@ -66,3 +82,22 @@ class CodexAgent(BaseAgent):
     def extract_cost(self, output: str) -> Optional[float]:
         """Codex does not provide cost information."""
         return None
+
+    def env_overrides(self) -> dict[str, str]:
+        """Ensure HOME points to the real user home.
+
+        Codex resolves ``~/.codex/config.toml`` and other paths via HOME.
+        When the parent process (e.g. Hermes with profiles) redirects HOME
+        to a profile directory, Codex cannot find its config and fails
+        with "No such file or directory".
+        """
+        real_home = _get_real_home()
+        current_home = os.environ.get("HOME", "")
+        if current_home != real_home:
+            logger.info(
+                "codex-home-override",
+                original_home=current_home,
+                real_home=real_home,
+            )
+            return {"HOME": real_home}
+        return {}

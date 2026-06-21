@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import pwd
 from typing import Any, Optional
 
 import structlog
@@ -11,6 +13,20 @@ from coding_agents.agents.base import BaseAgent
 from coding_agents.models import ExecutionConfig
 
 logger = structlog.get_logger(__name__)
+
+
+def _get_real_home() -> str:
+    """Resolve the real user home directory.
+
+    When the parent process redirects HOME (e.g. Hermes profiles set
+    HOME=~/.hermes/profiles/<name>/home), Claude Code fails to find its
+    config at ~/.claude/. We resolve the real home via pwd database
+    which is immune to HOME overrides.
+    """
+    try:
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except (KeyError, AttributeError):
+        return os.path.expanduser("~")
 
 
 class ClaudeAgent(BaseAgent):
@@ -78,3 +94,21 @@ class ClaudeAgent(BaseAgent):
         except (json.JSONDecodeError, ValueError, TypeError):
             pass
         return None
+
+    def env_overrides(self) -> dict[str, str]:
+        """Ensure HOME points to the real user home.
+
+        Claude Code resolves ``~/.claude/`` config/skills via HOME.
+        When the parent process (e.g. Hermes with profiles) redirects HOME
+        to a profile directory, Claude Code cannot find its config.
+        """
+        real_home = _get_real_home()
+        current_home = os.environ.get("HOME", "")
+        if current_home != real_home:
+            logger.info(
+                "claude-home-override",
+                original_home=current_home,
+                real_home=real_home,
+            )
+            return {"HOME": real_home}
+        return {}

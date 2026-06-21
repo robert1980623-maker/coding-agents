@@ -137,6 +137,13 @@ async def _run_single_task(
     agent_type_resolved: AgentType = task.resolve_agent_type()
     agent = get_agent(agent_type_resolved)
     config = task.config or ExecutionConfig()
+
+    # Merge agent-specific env overrides (e.g. Codex needs real HOME
+    # when the parent process redirects it, like Hermes profiles).
+    overrides = agent.env_overrides()
+    if overrides:
+        config.env = {**config.env, **overrides}
+
     command = agent.build_command(task.prompt, config)
 
     # Create session

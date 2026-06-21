@@ -362,6 +362,12 @@ async def _run_session(
         max_budget_usd=budget,  # None means "no cap"; agents honor or warn
     )
 
+    # Merge agent-specific env overrides (e.g. Codex needs real HOME
+    # when the parent process redirects it, like Hermes profiles).
+    overrides = adapter.env_overrides()
+    if overrides:
+        config.env = {**config.env, **overrides}
+
     command = adapter.build_command(prompt, config)
     if verbose:
         console.print(f"[dim]command: {' '.join(command)}[/dim]")
