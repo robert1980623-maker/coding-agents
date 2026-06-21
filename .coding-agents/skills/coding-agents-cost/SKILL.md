@@ -1,18 +1,39 @@
 ---
 name: coding-agents-cost
 description: |
-  How to estimate, monitor, and cap the cost of coding-agents
-  sessions. Use this skill when you need to decide on a budget,
-  track spend across runs, or design cost-aware batch pipelines.
+  How to estimate, monitor, and control the cost of coding-agents
+  sessions. Use this skill when you (a) need to read historical
+  spend to plan a budget, (b) were explicitly asked by the human to
+  cap a run with `--budget`, or (c) want to design cost-aware batch
+  pipelines. Do **not** use this skill to justify adding `--budget`
+  unprompted — the default is no budget, see coding-agents-dispatch.
 ---
 
 # Coding Agents — Cost
 
 ## When to use this skill
 
-- Before dispatching a session (picking a sensible `--budget`)
-- After seeing a budget-related warning on dispatch
-- When you want to understand historical cost patterns
+- The human explicitly asked you to set a `--budget` cap on a run
+- You want to read historical cost data to estimate a budget
+- You saw a budget-related warning on dispatch and need to interpret it
+- You are designing a batch pipeline where cost caps are required
+- You need to find an existing session's cost from the SQLite DB
+
+## Default: do not set --budget
+
+**Do not pass `--budget` unless the human asks for a cap.** This is
+the same rule as `coding-agents-dispatch`. The agent will keep
+running either way; an unprompted budget cap is more likely to
+undercut a legitimate long run than to save money.
+
+If you find yourself reaching for `--budget`, ask first:
+
+> "This is a <simple/medium/complex> task on `<project>`. Want me
+> to cap it at <$N>? Default is uncapped."
+
+Only set `--budget` after the human confirms the value.
+
+## When to use this skill
 
 ## How billing works per agent
 
@@ -79,7 +100,7 @@ sees the whole repo and burns tokens reading unrelated files.
 happily spend $8-12 exploring corners it doesn't need to. Match the
 cap to the task.
 
-### Multi-stage for expensive work
+### Multi-stage for expensive work (only when the human approved a budget)
 
 ```bash
 # Stage 1: cheap exploration — find the bug
@@ -91,7 +112,8 @@ coding-agents dispatch claude "fix: <summary from stage 1>" \
   --workdir ~/projects/my-app --budget 3
 ```
 
-Cheaper overall than one open-ended $10 run.
+Cheaper overall than one open-ended $10 run — but only do this if
+the human approved splitting the work into capped stages.
 
 ## Inspecting cost of a running / finished session
 
@@ -109,11 +131,12 @@ coding-agents gc --keep-result-only
 ## Hard rules
 
 1. **Always pass `--workdir`** — it's the cheapest win.
-2. **Always set `--budget` for claude** — safety net against runaway
-   loops or prompt injection.
+2. **Do NOT set `--budget` unless the human asks.** Default is
+   uncapped; only override when explicitly requested.
 3. **Don't set `--budget` for codex expecting a cap** — it's ignored;
-   you'll just see a warning.
-4. **Match budget to task size.** Review ≠ implementation ≠ refactor.
+   you'll just see a warning. Control cost via prompt scope instead.
+4. **If the human asks for a cap, match budget to task size.**
+   Review ≠ implementation ≠ refactor.
 5. **Re-read events before re-budgeting** if a session ran out — the
    events usually show where tokens were wasted.
 
