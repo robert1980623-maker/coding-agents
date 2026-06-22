@@ -24,9 +24,10 @@ runner = CliRunner()
 
 
 @pytest.fixture
-def mock_db(tmp_path: Path):
-    """Patch DEFAULT_DB to use a temp directory."""
+def mock_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Patch DEFAULT_DB and CODING_AGENTS_DB env var to use a temp directory."""
     db_path = tmp_path / "test.db"
+    monkeypatch.setenv("CODING_AGENTS_DB", str(db_path))
     with patch("coding_agents.cli.DEFAULT_DB", str(db_path)):
         yield db_path
 

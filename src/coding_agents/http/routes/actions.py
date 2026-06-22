@@ -70,16 +70,16 @@ async def kill_session(
 
 @router.post("/recover", response_model=RecoverResponse)
 async def recover_sessions(
-    timeout: int = 300,
+    timeout_seconds: int = 300,
     token: str = Depends(verify_token),
     storage: SQLiteStorage = Depends(),
 ) -> RecoverResponse:
     """Recover orphaned sessions.
 
-    Marks sessions that have been running for longer than the timeout
+    Marks sessions that have been running for longer than *timeout_seconds*
     without a heartbeat as ORPHANED.
     """
-    count = await storage.recover_orphaned_sessions(timeout_seconds=timeout)
+    count = await storage.recover_orphaned_sessions(timeout_seconds=timeout_seconds)
 
     return RecoverResponse(
         recovered_count=count,

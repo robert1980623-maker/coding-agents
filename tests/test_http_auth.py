@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import AsyncIterator
 
 import httpx
 import pytest
@@ -23,12 +24,13 @@ from coding_agents.storage.sqlite import SQLiteStorage
 
 
 @pytest.fixture
-async def storage(tmp_path: Path) -> SQLiteStorage:
+async def storage(tmp_path: Path) -> AsyncIterator[SQLiteStorage]:
     """Create a test storage instance."""
     db_path = tmp_path / "test.db"
     store = SQLiteStorage(str(db_path))
     await store.initialize()
-    return store
+    yield store
+    await store.close()
 
 
 @pytest.fixture
@@ -126,6 +128,21 @@ class TestTokenRequired:
         async with _client(app, {"Authorization": f"Bearer {token}"}) as client:
             response = await client.get("/sessions")
         assert response.status_code == 200
+
+    @pytest.mark.parametrize("scheme", ["bearer", "BEARER", "BeArEr", "Bearer"])
+    async def test_bearer_scheme_is_case_insensitive(
+        self, app, monkeypatch, tmp_path, scheme: str
+    ):
+        """RFC 7235 §2.1: auth-scheme is case-insensitive."""
+        token_path = tmp_path / "token"
+        token = ensure_token(str(token_path))
+        monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(token_path))
+
+        async with _client(app, {"Authorization": f"{scheme} {token}"}) as client:
+            response = await client.get("/sessions")
+        assert response.status_code == 200, (
+            f"{scheme!r} scheme should be accepted (RFC 7235 §2.1)"
+        )
 
 
 class TestMetricsAuth:

@@ -11,13 +11,14 @@ from __future__ import annotations
 from typing import Optional
 
 import logging
+import secrets
 
 import structlog
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from coding_agents.auth import load_token, validate_token
+from coding_agents.auth import load_token
 
 # Use stdlib logger so logs integrate with Python's logging system and can be
 # captured by standard logging handlers (e.g. pytest's caplog). The default
@@ -65,8 +66,10 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
         if request.url.path in PUBLIC_PATHS:
             return await call_next(request)
 
-        # If the token file does not exist, skip auth (dev mode).
-        # Warn once per process so the operator notices.
+        # Load the stored token once and reuse it for both the dev-mode
+        # check and the comparison below.  Re-reading the file at each
+        # layer would be a TOCTOU race (the file could vanish between
+        # reads) and wastes an I/O per request.
         stored = load_token(self.token_path)
         if stored is None:
             if not _dev_mode_warned:
@@ -80,8 +83,9 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         # Extract Bearer token from Authorization header.
+        # RFC 7235 §2.1: the auth-scheme is case-insensitive.
         auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
+        if not auth_header.lower().startswith("bearer "):
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Missing authorization header"},
@@ -89,7 +93,10 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
             )
 
         provided = auth_header[len("Bearer "):]
-        if not validate_token(provided, self.token_path):
+        # Constant-time comparison against the token we already loaded —
+        # do NOT call validate_token() here, as that would re-read the
+        # file from disk (TOCTOU + wasted I/O).
+        if not secrets.compare_digest(provided, stored):
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Invalid token"},

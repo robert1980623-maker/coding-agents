@@ -391,7 +391,7 @@ class TestActions:
         self, client: AsyncClient, storage: SQLiteStorage
     ):
         """POST /recover should recover orphaned sessions."""
-        response = await client.post("/recover?timeout=300")
+        response = await client.post("/recover?timeout_seconds=300")
         assert response.status_code == 200
         data = response.json()
         assert "recovered_count" in data

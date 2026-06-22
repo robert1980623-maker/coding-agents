@@ -53,6 +53,12 @@ def create_app(
         description="HTTP API for managing coding agent sessions",
         version="0.2.0",
         lifespan=lifespan,
+        # Disable auto-generated docs — they leak the full API schema
+        # (endpoints, params, response shapes) to anyone with network
+        # access, bypassing auth since they aren't in PUBLIC_PATHS.
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
 
     # Store token_path in app.state so dependencies can access it

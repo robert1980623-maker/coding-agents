@@ -38,8 +38,8 @@ def main() -> None:
     parser.add_argument(
         "--port",
         type=int,
-        default=8080,
-        help="Port to bind to",
+        default=8765,
+        help="Port to bind to (must match the SDK's DEFAULT_BASE_URL port)",
     )
     parser.add_argument(
         "--db",
@@ -79,7 +79,6 @@ def main() -> None:
     token = ensure_token(args.auth_token_file)
     token_path = get_token_path(args.auth_token_file)
     print(f"Auth token: {token_path}")
-    print(f"Token (first 8 chars): {token[:8]}...")
     print()
 
     # Import server here to ensure logging is configured first

@@ -65,15 +65,36 @@ def ensure_token(token_path: Optional[str] = None) -> str:
         token = load_token(str(path))
         if token is not None:
             return token
-        # File exists but is empty/invalid — regenerate
+        # File exists but is empty/invalid — regenerate.
+        # Remove it first so the O_EXCL create below succeeds.
         logger.warning("token_file_empty_regenerating", path=str(path))
+        try:
+            path.unlink()
+        except OSError:
+            pass  # Race: another process may have removed it
 
     # Generate new token
     token = generate_token()
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Write with restrictive permissions (owner read/write only)
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # Write with restrictive permissions (owner read/write only).
+    # O_EXCL makes the create atomic: if another process created the file
+    # between our exists() check and this open(), we get FileExistsError
+    # instead of silently overwriting their token (which would break their
+    # auth on next request).
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
+        with os.fdopen(fd, "w") as f:
+            f.write(token + "\n")
+    except FileExistsError:
+        # Another process won the race — load their token so both
+        # processes converge on the same value.
+        logger.info("token_generation_race_lost", path=str(path))
+        existing = load_token(str(path))
+        if existing is not None:
+            return existing
+        # File exists but is empty/unreadable — regenerate ours.
+        # This is rare; a second race here is acceptable.
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(token + "\n")
     except Exception:
