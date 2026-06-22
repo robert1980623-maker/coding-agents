@@ -21,3 +21,7 @@ dispatch convention (workdir + prompt, no skill list), see
   under `.claude/skills/` will reflect the change automatically.
 - **Do not duplicate skill content** into this file — reference the
   SKILL.md path instead, so there is exactly one place to update.
+
+## Release Process
+
+After bumping version and pushing a new tag, **always run `./install.sh`** to update the system binary. See [AGENTS.md Release Checklist](./AGENTS.md#release-checklist) for details.

@@ -52,3 +52,28 @@ Skill names are also valid slash-commands for interactive use:
 - **User-global skills**: `~/.claude/skills/`, `~/.codex/skills/`
   are reserved for personal, non-shared skills. Do not put
   project conventions there.
+
+## Release Checklist
+
+When bumping the version or making a release, **always run `./install.sh`** to update the system installation:
+
+```bash
+# 1. Update version in pyproject.toml
+# 2. Commit and push
+git add pyproject.toml && git commit -m "chore: bump version to X.Y.Z"
+git push origin main
+
+# 3. Create and push tag
+git tag vX.Y.Z
+git push origin vX.Y.Z
+
+# 4. **IMPORTANT**: Reinstall to update system binary
+./install.sh
+```
+
+The `install.sh` script:
+- Creates/updates a dedicated venv at `~/.local/share/coding-agents`
+- Installs the package from source
+- Creates a wrapper at `~/.local/bin/coding-agents`
+
+**Why this is required**: The system binary at `~/.local/bin/coding-agents` points to the venv. After code changes, the venv must be refreshed to pick up the new version.
