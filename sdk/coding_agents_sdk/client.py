@@ -8,7 +8,9 @@ and the caller is responsible for ensuring an executor consumes it
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -311,6 +313,101 @@ class AsyncCodingAgentClient:
         if response.status_code >= 400:
             await _raise_for_status(response)
         return response.text
+
+    # ------------------------------------------------------------------ #
+    # High-level: wait for completion
+    # ------------------------------------------------------------------ #
+
+    async def wait_for_completion(
+        self,
+        session_id: str,
+        *,
+        poll_interval: float = 300.0,
+        timeout: float = 3600.0,
+    ) -> Session:
+        """Block until session reaches a terminal state.
+
+        Terminal states: completed, failed, killed, timeout.
+
+        Args:
+            session_id: The session to wait for.
+            poll_interval: Seconds between status checks (default: 300.0 = 5 min).
+            timeout: Maximum seconds to wait (default: 3600.0 = 1 hour).
+
+        Returns:
+            The final Session object with terminal status.
+
+        Raises:
+            TimeoutError: If timeout exceeded before terminal state.
+            NotFoundError: If session does not exist.
+        """
+        terminal_states = {"completed", "failed", "killed", "timeout"}
+        start_time = time.monotonic()
+
+        while True:
+            session = await self.get_session(session_id)
+
+            if session.status in terminal_states:
+                return session
+
+            elapsed = time.monotonic() - start_time
+            if elapsed >= timeout:
+                raise TimeoutError(
+                    f"Session {session_id} did not complete within {timeout}s "
+                    f"(current status: {session.status})"
+                )
+
+            await asyncio.sleep(poll_interval)
+
+    async def watch_session(
+        self,
+        session_id: str,
+        *,
+        poll_interval: float = 300.0,
+        timeout: float = 3600.0,
+    ) -> AsyncIterator[Session]:
+        """Yield session on each status change until terminal state.
+
+        Terminal states: completed, failed, killed, timeout.
+
+        Args:
+            session_id: The session to watch.
+            poll_interval: Seconds between status checks (default: 300.0 = 5 min).
+            timeout: Maximum seconds to watch (default: 3600.0 = 1 hour).
+
+        Yields:
+            Session object each time status changes.
+
+        Raises:
+            TimeoutError: If timeout exceeded before terminal state.
+            NotFoundError: If session does not exist.
+
+        Example:
+            async for session in client.watch_session(session_id):
+                print(f"Status: {session.status}")
+        """
+        terminal_states = {"completed", "failed", "killed", "timeout"}
+        start_time = time.monotonic()
+        last_status = None
+
+        while True:
+            session = await self.get_session(session_id)
+
+            if session.status != last_status:
+                yield session
+                last_status = session.status
+
+            if session.status in terminal_states:
+                break
+
+            elapsed = time.monotonic() - start_time
+            if elapsed >= timeout:
+                raise TimeoutError(
+                    f"Session {session_id} did not complete within {timeout}s "
+                    f"(current status: {session.status})"
+                )
+
+            await asyncio.sleep(poll_interval)
 
     # ------------------------------------------------------------------ #
     # Internal helpers

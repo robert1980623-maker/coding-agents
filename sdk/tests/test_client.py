@@ -633,3 +633,90 @@ async def test_create_session_rejects_unknown_kwargs() -> None:
     ) as client:
         with pytest.raises(TypeError):
             await client.create_session(agent="claude", prompt="test", bogus_param="nope")
+
+
+# ---------------------------------------------------------------------- #
+# wait_for_completion
+# ---------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_wait_for_completion_returns_terminal_session() -> None:
+    """wait_for_completion should return session when it reaches terminal state."""
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        # First call: running, second call: completed
+        status = "running" if call_count == 1 else "completed"
+        return httpx.Response(200, json=make_session_payload(status=status))
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"GET /sessions/sess-123": handler}),
+    ) as client:
+        session = await client.wait_for_completion("sess-123", poll_interval=0.01)
+
+    assert session.status == "completed"
+    assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_wait_for_completion_timeout() -> None:
+    """wait_for_completion should raise TimeoutError if session doesn't complete."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=make_session_payload(status="running"))
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"GET /sessions/sess-123": handler}),
+    ) as client:
+        with pytest.raises(TimeoutError) as exc_info:
+            await client.wait_for_completion("sess-123", poll_interval=0.01, timeout=0.05)
+
+    assert "did not complete within" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------- #
+# watch_session
+# ---------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_watch_session_yields_on_status_change() -> None:
+    """watch_session should yield session on each status change."""
+    statuses = ["pending", "running", "running", "completed"]
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        status = statuses[min(call_count, len(statuses) - 1)]
+        call_count += 1
+        return httpx.Response(200, json=make_session_payload(status=status))
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"GET /sessions/sess-123": handler}),
+    ) as client:
+        yielded = []
+        async for session in client.watch_session("sess-123", poll_interval=0.01):
+            yielded.append(session.status)
+
+    # Should yield pending, running, completed (skip duplicate running)
+    assert yielded == ["pending", "running", "completed"]
+
+
+@pytest.mark.asyncio
+async def test_watch_session_timeout() -> None:
+    """watch_session should raise TimeoutError if session doesn't complete."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=make_session_payload(status="running"))
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"GET /sessions/sess-123": handler}),
+    ) as client:
+        with pytest.raises(TimeoutError):
+            async for _ in client.watch_session("sess-123", poll_interval=0.01, timeout=0.05):
+                pass

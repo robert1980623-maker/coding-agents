@@ -1208,14 +1208,15 @@ coding-agent tag list <session_id>
 coding-agent serve --port 8080 --host 127.0.0.1
 
 # 生产部署（需要认证）
-coding-agent serve --port 8080 --host 0.0.0.0 --auth-token <token>
+coding-agent serve --port 8080 --host 0.0.0.0 --auth-token-file /path/to/token
 ```
 
 **认证机制（v1.2.1 明确）**：
-- Token 来源：环境变量 `CODING_AGENT_AUTH_TOKEN` 或 `--auth-token` 参数
-- 验证方式：明文比对（`token == expected_token`）
-- 本地模式（127.0.0.1）：认证可选
-- 远程模式（0.0.0.0）：认证强制
+- Token 来源：文件（默认 `~/.coding-agents-token`）、环境变量 `CODING_AGENTS_TOKEN_PATH`（指定文件路径）、或 `--auth-token-file` 参数
+- 验证方式：恒定时间比对（`secrets.compare_digest`），防止时序攻击
+- Bearer scheme 大小写不敏感（RFC 7235 §2.1）
+- 开发模式：Token 文件不存在时认证自动禁用（一次警告）；文件存在但为空时拒绝所有请求（不降级到开发模式）
+- 注意：本地/远程模式的区别仅为默认绑定地址不同（127.0.0.1 vs 0.0.0.0），认证强制由 Token 文件是否存在决定
 
 **API 端点**：
 
@@ -1565,9 +1566,10 @@ jobs:
 | 措施 | 说明 |
 |------|------|
 | **默认绑定 localhost** | `--host 127.0.0.1`，仅本地访问 |
-| **Bearer token 认证** | 环境变量 `CODING_AGENT_AUTH_TOKEN` 或 `--auth-token` |
-| **本地模式** | 认证可选 |
-| **远程模式** | 认证强制 |
+| **Bearer token 认证** | Token 文件（默认 `~/.coding-agents-token`）、`CODING_AGENTS_TOKEN_PATH` 环境变量、或 `--auth-token-file` 参数 |
+| **恒定时间比对** | `secrets.compare_digest` 防止时序攻击 |
+| **空文件处理** | Token 文件存在但为空时拒绝请求（不降级到开发模式） |
+| **开发模式** | Token 文件不存在时认证禁用（单次警告） |
 
 ### 8.2 输入验证
 
