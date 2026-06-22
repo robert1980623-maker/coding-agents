@@ -1,6 +1,6 @@
 [project]
 name = "coding-agents-sdk"
-version = "0.2.0"
+version = "0.3.0"
 description = "Async Python SDK for the coding-agents HTTP API (pure HTTP wrapper, no execution semantics)"
 readme = "README.md"
 requires-python = ">=3.12"

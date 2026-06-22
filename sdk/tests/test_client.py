@@ -18,6 +18,7 @@ from coding_agents_sdk import (
     ConnectionError_,
     NetworkError,
     NotFoundError,
+    RateLimitError,
     ServerError,
 )
 
@@ -227,6 +228,39 @@ async def test_list_sessions_passes_filters() -> None:
     assert [s.session_id for s in sessions] == ["a", "b"]
 
 
+@pytest.mark.asyncio
+async def test_list_sessions_lightweight() -> None:
+    """lightweight=True should send lightweight=true query param to the server."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        # Server returns minimal data in lightweight mode — the SDK
+        # still parses it as Session objects.
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": "a",
+                    "agent": "claude",
+                    "status": "completed",
+                    "created_at": "2026-06-20T10:00:00+00:00",
+                    "updated_at": "2026-06-20T10:00:00+00:00",
+                },
+            ],
+        )
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"GET /sessions": handler}),
+    ) as client:
+        sessions = await client.list_sessions(lightweight=True)
+
+    assert captured["params"]["lightweight"] == "true"
+    assert len(sessions) == 1
+    assert sessions[0].session_id == "a"
+
+
 # ---------------------------------------------------------------------- #
 # Events
 # ---------------------------------------------------------------------- #
@@ -245,6 +279,50 @@ async def test_get_events_decodes_json_data() -> None:
     assert events[0].seq == 1
     assert events[0].type == "stdout"
     assert events[0].data == {"text": "hi"}
+
+
+@pytest.mark.asyncio
+async def test_get_events_type_filter() -> None:
+    """get_events(type='stdout') should send type=stdout as a query param."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        # Pretend the server already filtered — return only matching events.
+        return httpx.Response(
+            200,
+            json=[make_event_payload(seq=1, type_="stdout", data="match")],
+        )
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"GET /sessions/sess-123/events": handler}),
+    ) as client:
+        events = await client.get_events("sess-123", type="stdout")
+
+    # Server-side filtering: the query param must be present.
+    assert captured["params"]["type"] == "stdout"
+    assert captured["params"]["after_seq"] == "0"
+    assert len(events) == 1
+    assert events[0].type == "stdout"
+
+
+@pytest.mark.asyncio
+async def test_get_events_no_type_filter_omits_param() -> None:
+    """When type is not passed, no type query param should be sent."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json=[])
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"GET /sessions/sess-123/events": handler}),
+    ) as client:
+        await client.get_events("sess-123")
+
+    assert "type" not in captured["params"]
 
 
 @pytest.mark.asyncio
@@ -720,3 +798,557 @@ async def test_watch_session_timeout() -> None:
         with pytest.raises(TimeoutError):
             async for _ in client.watch_session("sess-123", poll_interval=0.01, timeout=0.05):
                 pass
+
+
+# ---------------------------------------------------------------------- #
+# P0 fixes: WaitTimeoutError, CancelToken, poll_interval default
+# ---------------------------------------------------------------------- #
+
+
+def test_wait_timeout_error_is_timeout_error_subclass() -> None:
+    """WaitTimeoutError must be catchable as builtin TimeoutError (backward compat)."""
+    from coding_agents_sdk import WaitTimeoutError, CodingAgentsSDKError
+
+    err = WaitTimeoutError("timed out")
+    assert isinstance(err, TimeoutError)
+    assert isinstance(err, CodingAgentsSDKError)
+    assert str(err) == "timed out"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_completion_raises_wait_timeout_error() -> None:
+    """wait_for_completion should raise WaitTimeoutError (also catchable as TimeoutError)."""
+    from coding_agents_sdk import WaitTimeoutError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=make_session_payload(status="running"))
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"GET /sessions/sess-123": handler}),
+    ) as client:
+        with pytest.raises(WaitTimeoutError) as exc_info:
+            await client.wait_for_completion("sess-123", poll_interval=0.01, timeout=0.05)
+
+    assert "did not complete within" in str(exc_info.value)
+
+
+def test_default_poll_interval_is_2_seconds() -> None:
+    """DEFAULT_POLL_INTERVAL should be 2.0s, not 300s."""
+    from coding_agents_sdk.client import DEFAULT_POLL_INTERVAL
+
+    assert DEFAULT_POLL_INTERVAL == 2.0
+
+
+def test_cancel_token_basic_lifecycle() -> None:
+    """CancelToken should start uncancelled, toggle, and reset."""
+    from coding_agents_sdk import CancelToken
+
+    token = CancelToken()
+    assert token.is_cancelled is False
+    assert bool(token) is False
+
+    token.cancel()
+    assert token.is_cancelled is True
+    assert bool(token) is True
+
+    token.reset()
+    assert token.is_cancelled is False
+    assert bool(token) is False
+
+
+@pytest.mark.asyncio
+async def test_create_session_attaches_cancel_token() -> None:
+    """create_session() should attach a CancelToken to the returned Session."""
+    from coding_agents_sdk import CancelToken
+    import json
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"POST /sessions": lambda r: httpx.Response(201, json=make_session_payload())}),
+    ) as client:
+        session = await client.create_session(agent="claude", prompt="test")
+
+    assert hasattr(session, "cancel_token")
+    assert isinstance(session.cancel_token, CancelToken)
+    assert session.cancel_token.is_cancelled is False
+
+
+@pytest.mark.asyncio
+async def test_wait_for_completion_cancelled_via_token() -> None:
+    """wait_for_completion should raise CancelledError when cancel_token is cancelled."""
+    from coding_agents_sdk import CancelledError, CancelToken
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=make_session_payload(status="running"))
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"GET /sessions/sess-123": handler}),
+    ) as client:
+        token = CancelToken()
+        # Cancel from another "task" after a short delay.
+        async def cancel_soon() -> None:
+            await asyncio.sleep(0.05)
+            token.cancel()
+
+        import asyncio
+        task = asyncio.create_task(cancel_soon())
+
+        with pytest.raises(CancelledError):
+            await client.wait_for_completion("sess-123", poll_interval=0.02, cancel_token=token)
+
+        await task
+
+
+@pytest.mark.asyncio
+async def test_watch_session_cancelled_via_token() -> None:
+    """watch_session should raise CancelledError when cancel_token is cancelled."""
+    from coding_agents_sdk import CancelledError, CancelToken
+    import asyncio
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=make_session_payload(status="running"))
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"GET /sessions/sess-123": handler}),
+    ) as client:
+        token = CancelToken()
+
+        async def cancel_soon() -> None:
+            await asyncio.sleep(0.05)
+            token.cancel()
+
+        task = asyncio.create_task(cancel_soon())
+
+        with pytest.raises(CancelledError):
+            async for _ in client.watch_session("sess-123", poll_interval=0.02, cancel_token=token):
+                pass
+
+        await task
+
+
+@pytest.mark.asyncio
+async def test_wait_for_completion_uses_session_cancel_token() -> None:
+    """End-to-end: session.cancel_token from create_session cancels the wait."""
+    from coding_agents_sdk import CancelledError
+    import asyncio
+
+    call_count = 0
+
+    def session_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=make_session_payload(status="running"))
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({
+            "POST /sessions": lambda r: httpx.Response(201, json=make_session_payload()),
+            "GET /sessions/sess-123": session_handler,
+        }),
+    ) as client:
+        session = await client.create_session(agent="claude", prompt="test")
+
+        async def cancel_soon() -> None:
+            await asyncio.sleep(0.05)
+            session.cancel_token.cancel()
+
+        task = asyncio.create_task(cancel_soon())
+
+        with pytest.raises(CancelledError):
+            await client.wait_for_completion(
+                session.session_id, poll_interval=0.02, cancel_token=session.cancel_token,
+            )
+
+        await task
+
+
+# ---------------------------------------------------------------------- #
+# Retry logic
+# ---------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_request_retries_on_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Requests should retry on 503 with exponential backoff."""
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            return httpx.Response(503, text="unavailable")
+        return httpx.Response(200, json={"status": "healthy"})
+
+    # Mock asyncio.sleep to avoid actual delays
+    monkeypatch.setattr("coding_agents_sdk.client.asyncio.sleep", _no_op_sleep)
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"GET /health": handler}),
+    ) as client:
+        result = await client.health()
+
+    assert result.status == "healthy"
+    assert call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_request_retries_on_504(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Requests should retry on 504 Gateway Timeout."""
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count < 2:
+            return httpx.Response(504, text="gateway timeout")
+        return httpx.Response(200, json=make_session_payload())
+
+    monkeypatch.setattr("coding_agents_sdk.client.asyncio.sleep", _no_op_sleep)
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"GET /sessions/sess-123": handler}),
+    ) as client:
+        session = await client.get_session("sess-123")
+
+    assert session.session_id == "sess-123"
+    assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_request_retries_on_connection_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Requests should retry on connection errors."""
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count < 2:
+            raise httpx.ConnectError("refused")
+        return httpx.Response(200, json={"status": "healthy"})
+
+    monkeypatch.setattr("coding_agents_sdk.client.asyncio.sleep", _no_op_sleep)
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        result = await client.health()
+
+    assert result.status == "healthy"
+    assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_request_exhausts_retries_on_persistent_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After max_retries, a persistent 503 should raise ServerError."""
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(503, text="unavailable")
+
+    monkeypatch.setattr("coding_agents_sdk.client.asyncio.sleep", _no_op_sleep)
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"GET /health": handler}),
+    ) as client:
+        with pytest.raises(ServerError) as exc_info:
+            await client.health()
+
+    assert exc_info.value.status_code == 503
+    # Initial attempt + max_retries (default 3) = 4 total attempts
+    assert call_count == 4
+
+
+@pytest.mark.asyncio
+async def test_request_respects_429_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
+    """429 responses should respect the Retry-After header."""
+    call_count = 0
+    sleep_calls: list[float] = []
+
+    async def mock_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count < 2:
+            return httpx.Response(
+                429,
+                headers={"retry-after": "2.5"},
+                json={"detail": "rate limited"},
+            )
+        return httpx.Response(200, json={"status": "healthy"})
+
+    monkeypatch.setattr("coding_agents_sdk.client.asyncio.sleep", mock_sleep)
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"GET /health": handler}),
+    ) as client:
+        result = await client.health()
+
+    assert result.status == "healthy"
+    assert call_count == 2
+    # Should have slept for the Retry-After value
+    assert len(sleep_calls) == 1
+    assert sleep_calls[0] == 2.5
+
+
+@pytest.mark.asyncio
+async def test_request_429_raises_rate_limit_error_after_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After exhausting retries on 429, should raise RateLimitError."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            headers={"retry-after": "1"},
+            json={"detail": "rate limited"},
+        )
+
+    monkeypatch.setattr("coding_agents_sdk.client.asyncio.sleep", _no_op_sleep)
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"GET /health": handler}),
+    ) as client:
+        with pytest.raises(RateLimitError) as exc_info:
+            await client.health()
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.retry_after == 1.0
+    assert exc_info.value.detail == "rate limited"
+
+
+@pytest.mark.asyncio
+async def test_request_no_retry_on_non_retryable_error() -> None:
+    """Non-retryable errors (400, 401, 404, 500) should not be retried."""
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(400, json={"detail": "bad request"})
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"GET /health": handler}),
+        max_retries=3,
+    ) as client:
+        with pytest.raises(APIError) as exc_info:
+            await client.health()
+
+    assert exc_info.value.status_code == 400
+    # Should only have been called once — no retries for 400
+    assert call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_max_retries_zero_disables_retries() -> None:
+    """max_retries=0 should disable retries entirely."""
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        raise httpx.ConnectError("refused")
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=httpx.MockTransport(handler),
+        max_retries=0,
+    ) as client:
+        with pytest.raises(NetworkError):
+            await client.health()
+
+    assert call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_events_auto_reconnects(monkeypatch: pytest.MonkeyPatch) -> None:
+    """stream_events() should auto-reconnect on connection failure and resume from last event ID."""
+    events = [
+        make_event_payload(seq=1, type_="stdout", data="hello"),
+    ]
+
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # First call: simulate connection error
+            raise httpx.ConnectError("Connection refused")
+        # Second call: verify Last-Event-ID was NOT sent (no events received yet)
+        # and return events successfully
+        return sse_response(events)
+
+    monkeypatch.setattr("coding_agents_sdk.client.asyncio.sleep", _no_op_sleep)
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=httpx.MockTransport(handler),
+        max_retries=3,
+    ) as client:
+        out = []
+        async for ev in client.stream_events("sess-123"):
+            out.append(ev)
+            if len(out) == 1:
+                break
+
+    assert len(out) == 1
+    assert out[0].seq == 1
+    assert call_count == 2  # First failed, second succeeded
+
+
+@pytest.mark.asyncio
+async def test_stream_events_resumes_from_last_event_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """stream_events() should track last event ID for manual reconnection."""
+    events = [
+        make_event_payload(seq=42, type_="stdout", data="hello"),
+    ]
+
+    captured_headers = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_headers["last-event-id"] = request.headers.get("last-event-id")
+        return sse_response(events)
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"GET /sessions/sess-123/events/stream": handler}),
+    ) as client:
+        # Pass last_event_id explicitly - this is how callers resume
+        out = []
+        async for ev in client.stream_events("sess-123", last_event_id=42):
+            out.append(ev)
+            if len(out) == 1:
+                break
+
+    assert len(out) == 1
+    assert out[0].seq == 42
+    # Verify the header was sent on the initial call
+    assert captured_headers["last-event-id"] == "42"
+
+
+@pytest.mark.asyncio
+async def test_stream_events_reconnects_on_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    """stream_events() should reconnect when server returns 503."""
+    events = [
+        make_event_payload(seq=1, type_="stdout", data="hello"),
+    ]
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return httpx.Response(503, text="unavailable")
+        return sse_response(events)
+
+    monkeypatch.setattr("coding_agents_sdk.client.asyncio.sleep", _no_op_sleep)
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"GET /sessions/sess-123/events/stream": handler}),
+    ) as client:
+        out = []
+        async for ev in client.stream_events("sess-123", max_retries=3):
+            out.append(ev)
+            if len(out) == 1:
+                break
+
+    assert len(out) == 1
+    assert out[0].seq == 1
+    assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_stream_events_gives_up_after_max_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """stream_events() should raise NetworkError after exhausting reconnects."""
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr("coding_agents_sdk.client.asyncio.sleep", _no_op_sleep)
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=httpx.MockTransport(handler),
+        max_retries=2,
+    ) as client:
+        with pytest.raises(NetworkError):
+            async for _ in client.stream_events("sess-123"):
+                pass
+
+    # 1 initial + 2 retries = 3 attempts
+    assert call_count == 3
+
+
+def test_retry_after_parse_integer() -> None:
+    """_parse_retry_after should handle integer seconds."""
+    from coding_agents_sdk.client import _parse_retry_after
+
+    assert _parse_retry_after("5") == 5.0
+    assert _parse_retry_after("0") == 0.0
+    assert _parse_retry_after(None) is None
+
+
+def test_retry_after_parse_http_date() -> None:
+    """_parse_retry_after should handle HTTP-date format."""
+    from coding_agents_sdk.client import _parse_retry_after
+    from email.utils import format_datetime
+    from datetime import datetime, timezone, timedelta
+
+    future = datetime.now(timezone.utc) + timedelta(seconds=10)
+    http_date = format_datetime(future, usegmt=True)
+    result = _parse_retry_after(http_date)
+    assert result is not None
+    # Should be roughly 10 seconds (allow some tolerance)
+    assert 5 <= result <= 15
+
+
+def test_compute_retry_delay_exponential() -> None:
+    """_compute_retry_delay should use exponential backoff with jitter."""
+    from coding_agents_sdk.client import _compute_retry_delay
+
+    # With base_delay=1, max_delay=60:
+    # attempt 0: 1 * 2^0 = 1, with jitter: 0.5-1.5
+    # attempt 1: 1 * 2^1 = 2, with jitter: 1.0-3.0
+    # attempt 2: 1 * 2^2 = 4, with jitter: 2.0-6.0
+    # attempt 3: 1 * 2^3 = 8, with jitter: 4.0-12.0
+    delay0 = _compute_retry_delay(0, 1.0, 60.0)
+    assert 0.5 <= delay0 <= 1.5
+
+    delay1 = _compute_retry_delay(1, 1.0, 60.0)
+    assert 1.0 <= delay1 <= 3.0
+
+    delay3 = _compute_retry_delay(3, 1.0, 60.0)
+    assert 4.0 <= delay3 <= 12.0
+
+
+def test_compute_retry_delay_respects_max() -> None:
+    """_compute_retry_delay should never exceed max_delay."""
+    from coding_agents_sdk.client import _compute_retry_delay
+
+    # Even with large attempt numbers, delay should be capped at max_delay
+    delay = _compute_retry_delay(20, 1.0, 10.0)
+    assert delay <= 15.0  # max_delay * 1.5 (max jitter)
+
+
+# ---------------------------------------------------------------------- #
+# Helpers for retry tests
+# ---------------------------------------------------------------------- #
+
+
+async def _no_op_sleep(seconds: float) -> None:
+    """A no-op replacement for asyncio.sleep in tests."""
+    pass

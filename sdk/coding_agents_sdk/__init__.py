@@ -21,15 +21,18 @@ Quick start:
 
 from __future__ import annotations
 
-from coding_agents_sdk.client import AsyncCodingAgentClient
+from coding_agents_sdk.client import AsyncCodingAgentClient, CancelToken
 from coding_agents_sdk.exceptions import (
     APIError,
     AuthenticationError,
+    CancelledError,
     CodingAgentsSDKError,
     ConnectionError_,
     NetworkError,
     NotFoundError,
+    RateLimitError,
     ServerError,
+    WaitTimeoutError,
 )
 from coding_agents_sdk.models import (
     AgentType,
@@ -51,6 +54,8 @@ __all__ = [
     "APIError",
     "AsyncCodingAgentClient",
     "AuthenticationError",
+    "CancelledError",
+    "CancelToken",
     "CodingAgentsSDKError",
     "ConnectionError_",
     "Event",
@@ -58,10 +63,12 @@ __all__ = [
     "KillResult",
     "NetworkError",
     "NotFoundError",
+    "RateLimitError",
     "RecoverResult",
     "ServerError",
     "Session",
     "SessionStatus",
     "Tag",
     "TagsList",
+    "WaitTimeoutError",
 ]
