@@ -54,4 +54,5 @@ dev = [
     "psutil>=7.2.2",
     "pytest-benchmark>=5.2.3",
     "pytest-timeout>=2.4.0",
+    "types-PyYAML>=6.0",
 ]

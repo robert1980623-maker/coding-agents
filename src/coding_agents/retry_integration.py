@@ -35,15 +35,13 @@ def make_executor_with_retry(
         A wrapped executor with retry logic
     """
 
-    class RetryingExecutor:
+    class RetryingExecutor(StreamExecutor):
         """Proxy that adds retry to execute()."""
 
         def __init__(self, wrapped: StreamExecutor, retry_policy: RetryPolicy) -> None:
+            super().__init__(wrapped.store, wrapped.config)
             self._wrapped = wrapped
             self._policy = retry_policy
-            # Proxy other attributes
-            self.store = wrapped.store
-            self.config = wrapped.config
 
         async def execute(
             self,
