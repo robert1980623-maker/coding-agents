@@ -16,6 +16,7 @@ from coding_agents_sdk import (
     AsyncCodingAgentClient,
     AuthenticationError,
     ConnectionError_,
+    NetworkError,
     NotFoundError,
     ServerError,
 )
@@ -324,7 +325,7 @@ async def test_recover_passes_timeout() -> None:
     ) as client:
         result = await client.recover(timeout_seconds=120)
 
-    assert captured["params"]["timeout"] == "120"
+    assert captured["params"]["timeout_seconds"] == "120"
     assert result.recovered_count == 3
 
 
@@ -541,3 +542,94 @@ async def test_trailing_slash_is_stripped() -> None:
         await client.health()
 
     assert captured["path"] == "/health"
+
+
+# ---------------------------------------------------------------------- #
+# P0-2: stream_events default timeout
+# ---------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_stream_events_default_timeout_is_one_hour() -> None:
+    """stream_events() should default to 1h timeout for long-running sessions."""
+    from coding_agents_sdk.client import DEFAULT_STREAM_TIMEOUT
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["timeout"] = request.extensions.get("timeout")
+        return sse_response([])
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"GET /sessions/sess-123/events/stream": handler}),
+    ) as client:
+        async for _ in client.stream_events("sess-123"):
+            break
+
+    # The timeout should be DEFAULT_STREAM_TIMEOUT (3600.0), not the client default (30.0)
+    assert DEFAULT_STREAM_TIMEOUT == 3600.0
+
+
+# ---------------------------------------------------------------------- #
+# P1-2: list_sessions tag repeated params
+# ---------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_tag_repeated_params() -> None:
+    """Tags should be sent as repeated query params (tag=a&tag=b)."""
+    captured_url: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_url["query"] = str(request.url.query)
+        return httpx.Response(200, json=[])
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"GET /sessions": handler}),
+    ) as client:
+        await client.list_sessions(tag=["important", "urgent"])
+
+    # The query string should contain both tag values
+    query = captured_url["query"]
+    assert "tag=important" in query
+    assert "tag=urgent" in query
+
+
+# ---------------------------------------------------------------------- #
+# P2-2: NetworkError alias
+# ---------------------------------------------------------------------- #
+
+
+def test_network_error_is_connection_error_alias() -> None:
+    """NetworkError should be the same class as ConnectionError_ (deprecated alias)."""
+    assert NetworkError is ConnectionError_
+
+
+@pytest.mark.asyncio
+async def test_connection_failure_raises_network_error() -> None:
+    """Network errors should be catchable as NetworkError."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    transport = httpx.MockTransport(handler)
+    async with AsyncCodingAgentClient(base_url="http://test", transport=transport) as client:
+        with pytest.raises(NetworkError):
+            await client.health()
+
+
+# ---------------------------------------------------------------------- #
+# P2-4: create_session rejects unknown kwargs
+# ---------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_create_session_rejects_unknown_kwargs() -> None:
+    """create_session() should raise TypeError for unknown keyword arguments."""
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"POST /sessions": lambda r: httpx.Response(201, json=make_session_payload())}),
+    ) as client:
+        with pytest.raises(TypeError):
+            await client.create_session(agent="claude", prompt="test", bogus_param="nope")

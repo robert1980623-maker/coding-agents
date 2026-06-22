@@ -66,6 +66,10 @@ class Event(BaseModel):
     (string-encoded JSON), so the SDK keeps it as a raw value: if it parses as
     a JSON object/array we surface it as a dict/list, otherwise as the
     original string. Use :attr:`raw_json` for the exact string the server sent.
+
+    .. note::
+        ``data`` is auto-decoded from a JSON string.  It may be a ``dict``,
+        ``list``, or plain ``str`` depending on the original payload.
     """
 
     model_config = ConfigDict(extra="allow")
@@ -82,7 +86,13 @@ class Event(BaseModel):
 
     @classmethod
     def from_response(cls, payload: dict[str, Any]) -> "Event":
-        """Build an Event from the server response, decoding ``data`` if it's JSON."""
+        """Build an Event from the server response, decoding ``data`` if it's JSON.
+
+        .. note::
+            ``session_id`` is required in *payload*.  If missing, an empty
+            string is used as a safe fallback (callers should ensure the field
+            is always present).
+        """
         import json
 
         raw_data = payload.get("data")
@@ -95,7 +105,7 @@ class Event(BaseModel):
                 decoded = raw_data
 
         return cls(
-            session_id=payload["session_id"],
+            session_id=payload.get("session_id", ""),
             seq=payload["seq"],
             type=payload["type"],
             data=decoded,

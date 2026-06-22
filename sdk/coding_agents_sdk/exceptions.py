@@ -74,7 +74,16 @@ class ConnectionError_(CodingAgentsSDKError):
     """Raised when the SDK cannot reach the server (network/timeout).
 
     The trailing underscore avoids clashing with the builtin ``ConnectionError``.
+
+    .. deprecated::
+        Use :class:`NetworkError` instead. ``ConnectionError_`` is kept as a
+        backwards-compatible alias.
     """
+
+
+# Preferred name — more descriptive and avoids the builtin clash without the
+# trailing underscore.  ``ConnectionError_`` is kept as a deprecated alias.
+NetworkError = ConnectionError_
 
 
 __all__ = [
@@ -82,6 +91,7 @@ __all__ = [
     "AuthenticationError",
     "CodingAgentsSDKError",
     "ConnectionError_",
+    "NetworkError",
     "NotFoundError",
     "ServerError",
 ]

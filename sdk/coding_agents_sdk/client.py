@@ -18,6 +18,7 @@ from coding_agents_sdk.exceptions import (
     APIError,
     AuthenticationError,
     ConnectionError_,
+    NetworkError,
     NotFoundError,
     ServerError,
 )
@@ -33,6 +34,7 @@ from coding_agents_sdk.models import (
 
 DEFAULT_BASE_URL = "http://localhost:8765"
 DEFAULT_TIMEOUT = 30.0
+DEFAULT_STREAM_TIMEOUT = 3600.0  # 1 hour — matches server-side 30 min poll window
 
 
 class AsyncCodingAgentClient:
@@ -122,7 +124,6 @@ class AsyncCodingAgentClient:
         *,
         workdir: str = ".",
         metadata: dict[str, Any] | None = None,
-        **_: Any,
     ) -> Session:
         """Create a new session (PENDING status).
 
@@ -159,8 +160,18 @@ class AsyncCodingAgentClient:
         if status is not None:
             params["status"] = status
         if tag:
-            # httpx supports repeated query params via list values
-            params["tag"] = tag
+            # Use a list of tuples to guarantee repeated query params
+            # (httpx may collapse list values in a dict into a single param).
+            params_list: list[tuple[str, Any]] = [
+                ("limit", limit),
+            ]
+            if agent is not None:
+                params_list.append(("agent", agent))
+            if status is not None:
+                params_list.append(("status", status))
+            for t in tag:
+                params_list.append(("tag", t))
+            params = params_list  # type: ignore[assignment]
         body = await self._get("/sessions", params=params)
         return [Session.model_validate(_normalize_session(item)) for item in body]
 
@@ -194,10 +205,16 @@ class AsyncCodingAgentClient:
         Uses ``GET /sessions/{session_id}/events/stream``. The iterator yields
         :class:`Event` instances until the server closes the stream or the
         caller breaks out of the loop.
+
+        The *timeout* defaults to 1 hour for long-running sessions (matching
+        the server-side 30-minute polling window with comfortable headroom).
         """
         headers: dict[str, str] = {"Accept": "text/event-stream"}
         if last_event_id is not None:
             headers["Last-Event-ID"] = str(last_event_id)
+
+        if timeout is None:
+            timeout = DEFAULT_STREAM_TIMEOUT
 
         request = self._client.build_request(
             "GET",
@@ -209,7 +226,7 @@ class AsyncCodingAgentClient:
         try:
             response = await self._client.send(request, stream=True)
         except httpx.HTTPError as exc:
-            raise ConnectionError_(f"Failed to open SSE stream: {exc}") from exc
+            raise NetworkError(f"Failed to open SSE stream: {exc}") from exc
 
         try:
             if response.status_code >= 400:
@@ -234,7 +251,7 @@ class AsyncCodingAgentClient:
 
     async def recover(self, *, timeout_seconds: int = 300) -> RecoverResult:
         """Recover orphaned sessions. Returns count recovered."""
-        body = await self._post("/recover", params={"timeout": timeout_seconds})
+        body = await self._post("/recover", params={"timeout_seconds": timeout_seconds})
         return RecoverResult.model_validate(body)
 
     # ------------------------------------------------------------------ #
@@ -277,14 +294,11 @@ class AsyncCodingAgentClient:
         try:
             response = await self._client.send(request)
         except httpx.HTTPError as exc:
-            raise ConnectionError_(f"Failed to reach server: {exc}") from exc
+            raise NetworkError(f"Failed to reach server: {exc}") from exc
 
-        try:
-            if response.status_code >= 400:
-                await _raise_for_status(response)
-            return HealthStatus.model_validate(response.json())
-        finally:
-            await response.aclose()
+        if response.status_code >= 400:
+            await _raise_for_status(response)
+        return HealthStatus.model_validate(response.json())
 
     async def metrics(self) -> str:
         """Return Prometheus metrics text (passthrough)."""
@@ -292,23 +306,20 @@ class AsyncCodingAgentClient:
         try:
             response = await self._client.send(request)
         except httpx.HTTPError as exc:
-            raise ConnectionError_(f"Failed to reach server: {exc}") from exc
+            raise NetworkError(f"Failed to reach server: {exc}") from exc
 
-        try:
-            if response.status_code >= 400:
-                await _raise_for_status(response)
-            return response.text
-        finally:
-            await response.aclose()
+        if response.status_code >= 400:
+            await _raise_for_status(response)
+        return response.text
 
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
 
-    async def _get(self, path: str, *, params: dict[str, Any] | None = None) -> Any:
+    async def _get(self, path: str, *, params: dict[str, Any] | list[tuple[str, Any]] | None = None) -> Any:
         return await self._request("GET", path, params=params)
 
-    async def _post(self, path: str, *, json: dict[str, Any] | None = None, params: dict[str, Any] | None = None) -> Any:
+    async def _post(self, path: str, *, json: dict[str, Any] | None = None, params: dict[str, Any] | list[tuple[str, Any]] | None = None) -> Any:
         return await self._request("POST", path, json=json, params=params)
 
     async def _delete(self, path: str) -> Any:
@@ -320,7 +331,7 @@ class AsyncCodingAgentClient:
         path: str,
         *,
         json: dict[str, Any] | None = None,
-        params: dict[str, Any] | None = None,
+        params: dict[str, Any] | list[tuple[str, Any]] | None = None,
     ) -> Any:
         try:
             response = await self._client.request(
@@ -330,7 +341,7 @@ class AsyncCodingAgentClient:
                 params=params,
             )
         except httpx.HTTPError as exc:
-            raise ConnectionError_(f"HTTP request failed: {exc}") from exc
+            raise NetworkError(f"HTTP request failed: {exc}") from exc
 
         try:
             if response.status_code >= 400:

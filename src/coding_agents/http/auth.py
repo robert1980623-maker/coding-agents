@@ -10,12 +10,13 @@ and the dependency passes through with an empty token string.
 
 from __future__ import annotations
 
+import secrets
 from typing import Optional
 
 from fastapi import HTTPException, Request, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from coding_agents.auth import load_token, validate_token
+from coding_agents.auth import load_token
 
 security = HTTPBearer(auto_error=False)
 
@@ -54,9 +55,15 @@ async def verify_token(
     """
     token_path = _get_token_path(request)
 
+    # Load the stored token once. Re-reading inside validate_token()
+    # would be a TOCTOU race and wastes an I/O per request.
+    stored = load_token(token_path)
+
     # Dev-mode bypass: no token file → auth disabled.
-    if load_token(token_path) is None:
-        return credentials.credentials if credentials else ""
+    # Return "" rather than the raw credentials — the caller must not
+    # treat the returned value as verified when no token file exists.
+    if stored is None:
+        return ""
 
     if credentials is None:
         raise HTTPException(
@@ -66,7 +73,7 @@ async def verify_token(
         )
 
     token = credentials.credentials
-    if not validate_token(token, token_path):
+    if not secrets.compare_digest(token, stored):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token",

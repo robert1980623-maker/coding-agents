@@ -27,6 +27,7 @@ from coding_agents_sdk.exceptions import (
     AuthenticationError,
     CodingAgentsSDKError,
     ConnectionError_,
+    NetworkError,
     NotFoundError,
     ServerError,
 )
@@ -55,6 +56,7 @@ __all__ = [
     "Event",
     "HealthStatus",
     "KillResult",
+    "NetworkError",
     "NotFoundError",
     "RecoverResult",
     "ServerError",
