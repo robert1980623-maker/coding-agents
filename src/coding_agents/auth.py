@@ -62,7 +62,7 @@ def ensure_token(token_path: Optional[str] = None) -> str:
     path = get_token_path(token_path)
 
     if path.exists():
-        token = load_token(token_path)
+        token = load_token(str(path))
         if token is not None:
             return token
         # File exists but is empty/invalid — regenerate
