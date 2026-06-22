@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import time
 from collections.abc import AsyncIterator
@@ -138,9 +139,10 @@ class AsyncCodingAgentClient:
         retry_base_delay: float = DEFAULT_RETRY_BASE_DELAY,
         retry_max_delay: float = DEFAULT_RETRY_MAX_DELAY,
     ) -> None:
+        token = token or os.environ.get("CODING_AGENTS_TOKEN") or None
         if client is None:
             merged_headers: dict[str, str] = dict(headers or {})
-            if token is not None:
+            if token:
                 merged_headers["Authorization"] = f"Bearer {token}"
             client_kwargs: dict[str, Any] = {
                 "base_url": base_url.rstrip("/"),

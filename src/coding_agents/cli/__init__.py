@@ -54,15 +54,21 @@ def _global_options(
 ) -> None:
     """Global options for all commands."""
     setup_logging(level=log_level, json_output=log_json)
-    # Ensure auth token is available (generate if missing)
+    # Ensure auth token is available.
     # In Phase 1 we just materialize the token; Phase 2 HTTP server will validate it.
+    #
+    # We must call ensure_token() on every invocation — not just when the
+    # file is missing — because it also handles the case where the file
+    # exists but is empty/corrupt (crash during write, disk full, accidental
+    # truncation). Without this, the server would refuse all requests with
+    # a 500 error and the CLI would not auto-fix the broken auth state.
     token_path = get_token_path(auth_token_file)
-    if not token_path.exists():
-        token = ensure_token(auth_token_file)
+    file_missing = not token_path.exists()
+    ensure_token(auth_token_file)
+    if file_missing:
         console.print(
             f"[dim]Generated auth token at {token_path}[/dim]"
         )
-        _ = token  # phase 1: not consumed yet
 
 
 # --- Register sub-commands ----------------------------------------------------

@@ -56,6 +56,14 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
         """Initialize the middleware with an optional custom token path."""
         super().__init__(app)
         self.token_path = token_path
+        # Lazy-loaded token cache. The first request that needs the token
+        # reads the file from disk; every subsequent request uses the
+        # cached value. This eliminates the TOCTOU window where the file
+        # could be rewritten between the middleware's read and a later
+        # read (e.g. from ``verify_token``), which would otherwise cause
+        # spurious 401s on requests that the middleware already approved.
+        self._cached_token: Optional[str] = None
+        self._cache_loaded: bool = False
 
     async def dispatch(
         self, request: Request, call_next: RequestResponseEndpoint
@@ -63,13 +71,19 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
         global _dev_mode_warned  # noqa: PLW0603 — module-level flag
 
         # Public paths bypass auth entirely.
-        if request.url.path in PUBLIC_PATHS:
+        # Strip trailing slash so /health/ (common from load balancers)
+        # also matches — without this, health checks can fail with 401.
+        if request.url.path.rstrip("/") in PUBLIC_PATHS:
             return await call_next(request)
 
-        # Load the stored token once and reuse it for both the dev-mode
-        # check and the comparison below.  Re-reading the file at each
-        # layer would be a TOCTOU race (the file could vanish between
-        # reads) and wastes an I/O per request.
+        # Load the stored token from cache (populated lazily on the
+        # first non-public request) and reuse it for both the dev-mode
+        # check and the comparison below.
+        #
+        # The cache is populated once per middleware lifetime, NOT
+        # per-request, so subsequent requests cannot observe a file
+        # change made between the middleware's read and a later read
+        # (e.g. from ``verify_token``). This is the core TOCTOU fix.
         #
         # load_token returns:
         #   None  → file does not exist (dev mode: auth disabled).
@@ -77,7 +91,10 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
         #           reject rather than silently disable auth — this is
         #           the security-critical distinction).
         #   str   → valid token to compare against.
-        stored = load_token(self.token_path)
+        if not self._cache_loaded:
+            self._cached_token = load_token(self.token_path)
+            self._cache_loaded = True
+        stored = self._cached_token
         if stored is None:
             if not _dev_mode_warned:
                 logger.warning(
@@ -87,6 +104,10 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
                     "or set CODING_AGENTS_TOKEN_PATH."
                 )
                 _dev_mode_warned = True
+            # Signal to verify_token that we're in dev mode (auth disabled).
+            # Empty string means "no auth performed" — verify_token will
+            # return "" without re-checking the file.
+            request.state.auth_token = ""
             return await call_next(request)
         if stored == "":
             # Token file exists but is empty or unreadable. This is NOT
@@ -109,16 +130,20 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
             )
 
         # Extract Bearer token from Authorization header.
-        # RFC 7235 §2.1: the auth-scheme is case-insensitive.
+        # RFC 7235 §2.1: the auth-scheme is case-insensitive and followed by
+        # one or more whitespace characters (SP or HTAB) before the credentials.
+        # We split on whitespace to handle "Bearer token", "Bearer  token",
+        # "Bearer\ttoken", etc.
         auth_header = request.headers.get("Authorization", "")
-        if not auth_header.lower().startswith("bearer "):
+        parts = auth_header.split(None, 1)  # Split on any whitespace, max 1 split
+        if len(parts) != 2 or parts[0].lower() != "bearer":
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Missing authorization header"},
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
-        provided = auth_header[len("Bearer "):]
+        provided = parts[1].strip()  # Strip any trailing whitespace
         # Constant-time comparison against the token we already loaded —
         # do NOT call validate_token() here, as that would re-read the
         # file from disk (TOCTOU + wasted I/O).
@@ -128,6 +153,12 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
                 content={"detail": "Invalid token"},
                 headers={"WWW-Authenticate": "Bearer"},
             )
+
+        # Store the validated token in request.state so that verify_token
+        # can retrieve it without re-reading the file from disk. This
+        # eliminates the TOCTOU race where the file could change between
+        # the middleware read and the dependency read, causing false 401s.
+        request.state.auth_token = provided
 
         return await call_next(request)
 

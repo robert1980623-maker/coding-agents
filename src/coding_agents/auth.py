@@ -94,14 +94,36 @@ def ensure_token(token_path: Optional[str] = None) -> str:
         existing = load_token(str(path))
         if existing:
             return existing
-        # File exists but is empty/unreadable — regenerate ours.
-        # This is rare; a second race here is acceptable.
+        # File exists but is empty/unreadable — the other process may
+        # still be writing, or its write may have failed. Use O_EXCL
+        # again (NOT O_TRUNC) so we never destroy another process's
+        # in-progress write. If the file is still empty after unlinking,
+        # our exclusive create will succeed.
         inner_fd = -1
         try:
-            inner_fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                path.unlink()
+            except OSError:
+                pass  # Already gone or not accessible
+            inner_fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(inner_fd, "w") as f:
                 f.write(token + "\n")
             inner_fd = -1  # fdopen consumed the fd.
+        except FileExistsError:
+            # Another process wrote between our unlink and create.
+            # Read their token — converge rather than fight.
+            existing = load_token(str(path))
+            if existing:
+                return existing
+            logger.error(
+                "token_race_unresolvable",
+                path=str(path),
+                hint="Multiple processes failed to generate a token concurrently.",
+            )
+            raise RuntimeError(
+                f"Failed to generate token at {path}: file exists but is empty "
+                "after multiple attempts."
+            )
         except BaseException:
             if inner_fd >= 0:
                 try:

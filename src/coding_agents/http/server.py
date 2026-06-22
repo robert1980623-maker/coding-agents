@@ -59,6 +59,14 @@ def create_app(
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        # Disable automatic trailing-slash redirects. With the default
+        # ``redirect_slashes=True``, a request to ``/health/`` returns a
+        # 307 redirect to ``/health`` instead of running the handler.
+        # The Bearer auth middleware matches both ``/health`` and
+        # ``/health/`` (via ``rstrip("/")``), so callers — including
+        # load-balancer health checks that append a trailing slash —
+        # should get a 200 from the handler directly, not a 307.
+        redirect_slashes=False,
     )
 
     # Store token_path in app.state so dependencies can access it
@@ -82,8 +90,14 @@ def create_app(
     app.include_router(tags_router)
     app.include_router(metrics_router)
 
-    # Health check endpoint
+    # Health check endpoint. Registered at both /health and /health/ so
+    # callers (load balancers, orchestrators) that append a trailing
+    # slash still get a 200 directly. Combined with
+    # ``redirect_slashes=False`` above, this avoids a 307 redirect for
+    # the trailing-slash variant and a 404 if the trailing-slash route
+    # were missing.
     @app.get("/health")
+    @app.get("/health/")
     async def health() -> dict[str, str]:
         """Health check endpoint."""
         return {"status": "healthy"}

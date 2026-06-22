@@ -304,3 +304,66 @@ class TestValidateTokenEmptyFileRegression:
         assert load_token(str(token_dir)) == ""
         # validate_token must reject
         assert validate_token("any-token", str(token_dir)) is False
+
+
+class TestCLIEmptyTokenFileRegression:
+    """Regression test for CLI not regenerating empty token files.
+
+    The CLI's global callback (``_global_options``) previously only called
+    ``ensure_token()`` when the token file did NOT exist (``if not
+    token_path.exists()``). But ``ensure_token()`` also handles the case
+    where the file exists but is empty — regenerating the token.
+
+    When the file existed but was empty (e.g. crash during write, disk full,
+    accidental truncation), the CLI skipped ``ensure_token()`` and the
+    server would refuse all requests with a 500 error — auth was broken
+    but the CLI didn't auto-fix it.
+
+    Fix: always call ``ensure_token()`` from the CLI callback. It handles
+    all cases (missing, empty, valid) internally.
+    """
+
+    def test_cli_regenerates_empty_token_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """When the token file exists but is empty, the CLI callback must
+        regenerate it so the server can start with valid auth.
+        """
+        from typer.testing import CliRunner
+        from coding_agents.cli import app
+
+        token_file = tmp_path / "token"
+        token_file.write_text("")  # simulate crash-during-write
+        assert token_file.exists()
+        assert token_file.read_text() == ""
+
+        runner = CliRunner()
+        result = runner.invoke(app, ["--auth-token-file", str(token_file), "list"])
+
+        # The token file should now contain a valid token (64 hex chars)
+        content = token_file.read_text().strip()
+        assert len(content) == 64, (
+            f"CLI did not regenerate empty token file. Content: {content!r}"
+        )
+        int(content, 16)  # must be valid hex
+
+    def test_cli_does_not_overwrite_valid_token(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """When the token file exists and has a valid token, the CLI must
+        NOT regenerate it (preserving the existing token).
+        """
+        from typer.testing import CliRunner
+        from coding_agents.cli import app
+
+        token_file = tmp_path / "token"
+        token_file.write_text("existing-valid-token\n")
+
+        runner = CliRunner()
+        runner.invoke(app, ["--auth-token-file", str(token_file), "list"])
+
+        # The existing token should be preserved
+        content = token_file.read_text().strip()
+        assert content == "existing-valid-token", (
+            "CLI should not overwrite an existing valid token"
+        )

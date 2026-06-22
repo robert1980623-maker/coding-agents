@@ -80,6 +80,70 @@ class TestHealthBypass:
             response = await client.get("/health")
         assert response.status_code == 200
 
+    async def test_health_trailing_slash_bypasses_auth(self, app):
+        """GET /health/ (trailing slash) must also bypass auth.
+
+        Load balancers and health checkers frequently send trailing slashes;
+        without normalization, these would fail with 401.
+        """
+        async with _client(app) as client:
+            response = await client.get("/health/")
+        assert response.status_code == 200
+        assert response.json()["status"] == "healthy"
+
+
+class TestNoTOCTOU:
+    """verify_token must NOT re-read the token file after middleware validates it.
+
+    If the file changes between middleware read and verify_token read,
+    a request that passed middleware would get a false 401 at the route
+    level. The middleware stores the validated token in request.state.auth_token;
+    verify_token must read from there instead of re-reading the file.
+    """
+
+    async def test_verify_token_uses_middleware_result(
+        self, app, monkeypatch, tmp_path
+    ):
+        """After middleware validates, verify_token should not re-read the file.
+
+        We test this by changing the file content AFTER the middleware read
+        but BEFORE the route handler runs. If verify_token re-reads the file,
+        it would get a different token and return 401.
+        """
+        token_path = tmp_path / "token"
+        original_token = ensure_token(str(token_path))
+        monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(token_path))
+
+        # Track load_token calls in the route handler
+        load_count = {"count": 0}
+        original_load_token = __import__(
+            "coding_agents.http.auth", fromlist=["load_token"]
+        ).load_token if False else None  # noqa
+
+        async with _client(app, {"Authorization": f"Bearer {original_token}"}) as client:
+            # Warmup: the middleware reads the token file on this first
+            # non-public request and caches the result for the lifetime
+            # of the middleware. This is the load that would have happened
+            # in a real TOCTOU race (middleware read, then file change,
+            # then handler read).
+            warmup = await client.get("/sessions")
+            assert warmup.status_code == 200, (
+                f"warmup request failed with {warmup.status_code}: {warmup.text}"
+            )
+
+            # Now change the file. The middleware's cache still holds the
+            # original token, so the next request's Bearer check will use
+            # the cached value (not the new file content) and succeed.
+            # verify_token reads from request.state.auth_token (set by the
+            # middleware from the cache), not from the file, so the file
+            # change is invisible to it.
+            token_path.write_text("different-token\n")
+            response = await client.get("/sessions")
+
+        # Should still succeed because middleware already validated and
+        # stored the result in request.state.
+        assert response.status_code == 200
+
 
 class TestTokenRequired:
     """Non-public endpoints must require a valid Bearer token."""
@@ -142,6 +206,36 @@ class TestTokenRequired:
             response = await client.get("/sessions")
         assert response.status_code == 200, (
             f"{scheme!r} scheme should be accepted (RFC 7235 §2.1)"
+        )
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            "Bearer {token}",      # Single space (standard)
+            "Bearer  {token}",     # Double space
+            "Bearer\t{token}",     # Tab separator
+            "Bearer \t {token}",   # Mixed whitespace
+            "bearer  {token}",     # Lowercase + double space
+        ],
+    )
+    async def test_bearer_whitespace_handling(
+        self, app, monkeypatch, tmp_path, header: str
+    ):
+        """RFC 7235 §2.1: auth-scheme followed by 1+ whitespace (SP/HTAB).
+
+        The middleware must handle flexible whitespace between the scheme
+        and credentials, as clients may send "Bearer  token" (double space)
+        or "Bearer\\ttoken" (tab) instead of the standard single space.
+        """
+        token_path = tmp_path / "token"
+        token = ensure_token(str(token_path))
+        monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(token_path))
+
+        formatted_header = header.format(token=token)
+        async with _client(app, {"Authorization": formatted_header}) as client:
+            response = await client.get("/sessions")
+        assert response.status_code == 200, (
+            f"Header {formatted_header!r} should be accepted (RFC 7235 §2.1)"
         )
 
 
