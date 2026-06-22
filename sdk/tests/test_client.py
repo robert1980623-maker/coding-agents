@@ -522,6 +522,46 @@ async def test_token_sent_as_bearer() -> None:
     assert captured["auth"] == "Bearer secret-token"
 
 
+@pytest.mark.asyncio
+async def test_empty_token_env_var_does_not_send_auth_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: CODING_AGENTS_TOKEN="" must NOT send 'Authorization: Bearer '."""
+    monkeypatch.setenv("CODING_AGENTS_TOKEN", "")
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"status": "healthy"})
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        transport=make_handler({"GET /health": handler}),
+    ) as client:
+        await client.health()
+
+    assert "auth" not in captured or captured["auth"] is None
+
+
+@pytest.mark.asyncio
+async def test_empty_token_param_does_not_send_auth_header() -> None:
+    """Regression: token="" must NOT send 'Authorization: Bearer '."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"status": "healthy"})
+
+    async with AsyncCodingAgentClient(
+        base_url="http://test",
+        token="",
+        transport=make_handler({"GET /health": handler}),
+    ) as client:
+        await client.health()
+
+    assert "auth" not in captured or captured["auth"] is None
+
+
 # ---------------------------------------------------------------------- #
 # Error paths
 # ---------------------------------------------------------------------- #
