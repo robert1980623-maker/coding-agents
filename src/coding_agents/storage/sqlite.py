@@ -192,11 +192,18 @@ class SQLiteStorage:
 
         async with self._lock:
             await asyncio.to_thread(
-                conn.execute,
+                self._update_session_and_commit,
+                conn,
                 f"UPDATE sessions SET {set_clause} WHERE id = ?",  # nosec B608
                 values,
             )
-            await asyncio.to_thread(conn.commit)
+
+    def _update_session_and_commit(
+        self, conn: sqlite3.Connection, sql: str, values: list
+    ) -> None:
+        """Execute update and commit in a single thread call to reduce overhead."""
+        conn.execute(sql, values)
+        conn.commit()
 
     async def list_sessions(
         self,
@@ -401,14 +408,23 @@ class SQLiteStorage:
         ]
         async with self._lock:
             await asyncio.to_thread(
-                conn.executemany,
-                """
-                INSERT INTO events (session_id, channel, seq, type, data, raw_json, metadata, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                self._insert_events_and_commit,
+                conn,
                 rows,
             )
-            await asyncio.to_thread(conn.commit)
+
+    def _insert_events_and_commit(
+        self, conn: sqlite3.Connection, rows: list[tuple]
+    ) -> None:
+        """Insert events and commit in a single thread call to reduce overhead."""
+        conn.executemany(
+            """
+            INSERT INTO events (session_id, channel, seq, type, data, raw_json, metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        conn.commit()
 
     async def get_events(
         self,
@@ -467,7 +483,7 @@ class SQLiteStorage:
             after_seq: Only return events with seq > this value.
         """
         current_seq = after_seq
-        poll_interval = 1.0  # seconds between polls
+        poll_interval = 1.0  # seconds between polls — exponential backoff
         max_total_wait = 30 * 60  # 30 minutes
         elapsed = 0.0
 
@@ -479,6 +495,10 @@ class SQLiteStorage:
                 if event.seq > current_seq:
                     current_seq = event.seq
 
+            # Reset to high-frequency polling when new events arrive
+            if events:
+                poll_interval = 1.0
+
             # Check session status — stop if terminal
             session = await self.get_session(session_id)
             if session is None or session.status.is_terminal:
@@ -487,6 +507,9 @@ class SQLiteStorage:
             # Sleep before next poll
             await asyncio.sleep(poll_interval)
             elapsed += poll_interval
+
+            # Exponential backoff — cap at 10 s
+            poll_interval = min(poll_interval * 2, 10.0)
 
     async def search_events(
         self,
