@@ -38,6 +38,7 @@ class CodexAgent(BaseAgent):
             "exec",
             "--json",
             "--full-auto",
+            "--skip-git-repo-check",  # Allow running in non-git directories
         ]
 
         if config.model:

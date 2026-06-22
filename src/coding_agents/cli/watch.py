@@ -62,12 +62,12 @@ def watch(
                 if last_status is None:
                     # First check — print initial status
                     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                    console.print(f"[dim]{ts}[/dim] Status: {current_status}")
+                    console.print(f"[dim]\\[{ts}][/] Status: {current_status}")
                     last_status = current_status
                 elif current_status != last_status:
                     # Status changed — print transition
                     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                    console.print(f"[dim]{ts}[/dim] Status: {last_status} → {current_status}")
+                    console.print(f"[dim]\\[{ts}][/] Status: {last_status} → {current_status}")
                     last_status = current_status
 
                 # Check terminal state
