@@ -32,7 +32,7 @@ def _get_token_path(request: Request) -> Optional[str]:
 
 async def verify_token(
     request: Request,
-    credentials: HTTPAuthorizationCredentials | None = Security(security),
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(security),
 ) -> str:
     """Verify Bearer token against the stored token file.
 
@@ -57,6 +57,12 @@ async def verify_token(
 
     # Load the stored token once. Re-reading inside validate_token()
     # would be a TOCTOU race and wastes an I/O per request.
+    #
+    # load_token returns:
+    #   None  → file does not exist (dev mode: auth disabled).
+    #   ""    → file exists but is empty / unreadable (auth BROKEN:
+    #           reject rather than silently bypass).
+    #   str   → valid token to compare against.
     stored = load_token(token_path)
 
     # Dev-mode bypass: no token file → auth disabled.
@@ -64,6 +70,18 @@ async def verify_token(
     # treat the returned value as verified when no token file exists.
     if stored is None:
         return ""
+
+    if stored == "":
+        # Token file exists but is empty/unreadable. This is NOT dev mode
+        # — it means auth is broken. Refuse to validate rather than
+        # silently passing all requests.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Auth token file is empty or unreadable. "
+                "Regenerate it with the coding-agents CLI."
+            ),
+        )
 
     if credentials is None:
         raise HTTPException(

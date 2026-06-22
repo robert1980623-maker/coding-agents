@@ -63,7 +63,7 @@ def ensure_token(token_path: Optional[str] = None) -> str:
 
     if path.exists():
         token = load_token(str(path))
-        if token is not None:
+        if token:
             return token
         # File exists but is empty/invalid — regenerate.
         # Remove it first so the O_EXCL create below succeeds.
@@ -81,24 +81,34 @@ def ensure_token(token_path: Optional[str] = None) -> str:
     # between our exists() check and this open(), we get FileExistsError
     # instead of silently overwriting their token (which would break their
     # auth on next request).
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd = -1  # Sentinel: -1 means "no fd to close" (os.open didn't run/succeed).
     try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(token + "\n")
+        fd = -1  # fdopen consumed the fd; nothing to close on later error.
     except FileExistsError:
         # Another process won the race — load their token so both
         # processes converge on the same value.
         logger.info("token_generation_race_lost", path=str(path))
         existing = load_token(str(path))
-        if existing is not None:
+        if existing:
             return existing
         # File exists but is empty/unreadable — regenerate ours.
         # This is rare; a second race here is acceptable.
         fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(token + "\n")
-    except Exception:
-        # If fdopen fails, fd is already closed
+        fd = -1  # fdopen consumed the fd.
+    except BaseException:
+        # If os.fdopen fails the fd is NOT consumed — close it to avoid
+        # leaking. (Once fdopen succeeds, the with-block owns the fd and
+        # we reset fd to -1 above.)
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         raise
 
     logger.info("token_generated", path=str(path))
@@ -112,7 +122,11 @@ def load_token(token_path: Optional[str] = None) -> Optional[str]:
         token_path: Optional explicit path to the token file.
 
     Returns:
-        The token string, or None if the file does not exist or is empty.
+        The token string (stripped), or:
+        - ``None`` if the file does not exist (caller may enable dev mode).
+        - ``""`` if the file exists but is empty or unreadable (auth is
+          broken — callers MUST reject requests rather than fall through
+          to dev-mode bypass, which would silently disable auth).
     """
     path = get_token_path(token_path)
     if not path.exists():
@@ -120,11 +134,11 @@ def load_token(token_path: Optional[str] = None) -> Optional[str]:
     try:
         content = path.read_text().strip()
         if not content:
-            return None
+            return ""
         return content
     except OSError as e:
         logger.warning("token_load_failed", path=str(path), error=str(e))
-        return None
+        return ""
 
 
 def validate_token(provided: str, token_path: Optional[str] = None) -> bool:
@@ -139,7 +153,10 @@ def validate_token(provided: str, token_path: Optional[str] = None) -> bool:
     Returns:
         True if the token matches, False otherwise.
     """
-    stored = load_token(token_path)
-    if stored is None:
+    path = get_token_path(token_path)
+    stored = load_token(str(path))
+    if not stored:
+        # None → file missing; "" → file empty/corrupt.
+        # Either way, the provided token cannot be validated.
         return False
     return secrets.compare_digest(provided, stored)

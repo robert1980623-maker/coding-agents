@@ -222,6 +222,70 @@ class TestDevModeBypass:
         assert response.status_code == 200
 
 
+class TestCorruptTokenFile:
+    """A token file that exists but is empty/unreadable must NOT fall through
+    to dev-mode bypass — that would silently disable auth (security bug).
+
+    Instead, requests must be rejected with 500.
+    """
+
+    async def test_empty_token_file_rejects_requests(self, app, monkeypatch, tmp_path):
+        """Token file exists but is empty → 500, NOT 200."""
+        token_path = tmp_path / "token"
+        token_path.write_text("")  # exists but empty
+        monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(token_path))
+
+        # Sanity: load_token returns "" for empty file (not None)
+        assert load_token(str(token_path)) == ""
+
+        async with _client(app) as client:
+            response = await client.get("/sessions")
+        # Must NOT be 200 (that would mean auth was silently bypassed).
+        assert response.status_code == 500
+        assert "empty" in response.json()["detail"].lower() or "unreadable" in response.json()["detail"].lower()
+
+    async def test_empty_token_file_rejects_even_with_valid_looking_header(
+        self, app, monkeypatch, tmp_path
+    ):
+        """Even with an Authorization header, empty token file → 500.
+
+        The token can't be validated because there's nothing stored to
+        compare against — rejecting with 500 is the safe default.
+        """
+        token_path = tmp_path / "token"
+        token_path.write_text("")
+        monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(token_path))
+
+        async with _client(app, {"Authorization": "Bearer some-token"}) as client:
+            response = await client.get("/sessions")
+        assert response.status_code == 500
+
+    async def test_empty_token_file_still_allows_health(self, app, monkeypatch, tmp_path):
+        """/health is fully public — not affected by corrupt token file."""
+        token_path = tmp_path / "token"
+        token_path.write_text("")
+        monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(token_path))
+
+        async with _client(app) as client:
+            response = await client.get("/health")
+        assert response.status_code == 200
+
+    async def test_empty_token_file_logs_error(self, app, monkeypatch, tmp_path, caplog):
+        """An error should be logged when the token file is broken."""
+        token_path = tmp_path / "token"
+        token_path.write_text("")
+        monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(token_path))
+
+        with caplog.at_level(logging.ERROR, logger="coding_agents.http.middleware"):
+            async with _client(app) as client:
+                await client.get("/sessions")
+
+        assert any(
+            "auth_broken_token_file_empty" in r.getMessage()
+            for r in caplog.records
+        )
+
+
 class TestAllEndpointsProtected:
     """Spot-check that every route category goes through auth."""
 

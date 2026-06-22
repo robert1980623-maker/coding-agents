@@ -96,10 +96,15 @@ class TestLoadToken:
         token_file.write_text("my-secret\n")
         assert load_token(str(token_file)) == "my-secret"
 
-    def test_returns_none_for_empty_file(self, tmp_path: Path):
+    def test_returns_empty_string_for_empty_file(self, tmp_path: Path):
+        """Empty token file returns ``""`` (not ``None``).
+
+        ``None`` means "file missing" (dev-mode bypass OK).
+        ``""`` means "file exists but is broken" (auth must reject).
+        """
         token_file = tmp_path / "token"
         token_file.write_text("")
-        assert load_token(str(token_file)) is None
+        assert load_token(str(token_file)) == ""
 
 
 class TestValidateToken:

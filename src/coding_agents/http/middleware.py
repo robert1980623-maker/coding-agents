@@ -70,6 +70,13 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
         # check and the comparison below.  Re-reading the file at each
         # layer would be a TOCTOU race (the file could vanish between
         # reads) and wastes an I/O per request.
+        #
+        # load_token returns:
+        #   None  → file does not exist (dev mode: auth disabled).
+        #   ""    → file exists but is empty / unreadable (auth BROKEN:
+        #           reject rather than silently disable auth — this is
+        #           the security-critical distinction).
+        #   str   → valid token to compare against.
         stored = load_token(self.token_path)
         if stored is None:
             if not _dev_mode_warned:
@@ -81,6 +88,25 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
                 )
                 _dev_mode_warned = True
             return await call_next(request)
+        if stored == "":
+            # Token file exists but is empty or unreadable. This is NOT
+            # dev mode — it means auth is broken (e.g. crash during write,
+            # disk full, accidental truncation). Rejecting here prevents
+            # silently serving all requests without auth.
+            logger.error(
+                "auth_broken_token_file_empty: Token file exists but is "
+                "empty or unreadable — refusing to disable auth silently. "
+                "Run the coding-agents CLI to regenerate the token."
+            )
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "detail": (
+                        "Auth token file is empty or unreadable. "
+                        "Regenerate it with the coding-agents CLI."
+                    ),
+                },
+            )
 
         # Extract Bearer token from Authorization header.
         # RFC 7235 §2.1: the auth-scheme is case-insensitive.
