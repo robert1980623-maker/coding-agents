@@ -9,6 +9,7 @@ import structlog
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from coding_agents.http.middleware import BearerTokenMiddleware
 from coding_agents.http.metrics_endpoint import router as metrics_router
 from coding_agents.http.routes.actions import router as actions_router
 from coding_agents.http.routes.events import router as events_router
@@ -19,11 +20,16 @@ from coding_agents.storage.sqlite import SQLiteStorage
 logger = structlog.get_logger(__name__)
 
 
-def create_app(db_path: str = "~/.coding-agents/data.db") -> FastAPI:
+def create_app(
+    db_path: str = "~/.coding-agents/data.db",
+    token_path: str | None = None,
+) -> FastAPI:
     """Create and configure the FastAPI application.
 
     Args:
         db_path: Path to the SQLite database file.
+        token_path: Path to the auth token file. If None, uses the default
+            path (``~/.coding-agents-token``).
 
     Returns:
         Configured FastAPI application.
@@ -48,6 +54,13 @@ def create_app(db_path: str = "~/.coding-agents/data.db") -> FastAPI:
         version="0.2.0",
         lifespan=lifespan,
     )
+
+    # Store token_path in app.state so dependencies can access it
+    app.state.token_path = token_path
+
+    # Bearer token authentication middleware.
+    # Skips /health; skips auth entirely if no token file exists (dev mode).
+    app.add_middleware(BearerTokenMiddleware, token_path=token_path)
 
     # Dependency override for storage injection
     async def get_storage() -> SQLiteStorage:

@@ -85,7 +85,7 @@ def main() -> None:
     # Import server here to ensure logging is configured first
     from coding_agents.http.server import create_app
 
-    app = create_app(db_path=args.db)
+    app = create_app(db_path=args.db, token_path=args.auth_token_file)
 
     print(f"Starting server on http://{args.host}:{args.port}")
     print(f"Database: {args.db}")

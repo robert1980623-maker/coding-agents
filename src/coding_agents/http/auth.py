@@ -1,29 +1,63 @@
-"""Bearer token authentication middleware for FastAPI."""
+"""Bearer token authentication dependency for FastAPI routes.
+
+Works alongside ``BearerTokenMiddleware`` (which handles the HTTP-layer
+check). This dependency exists so routes that need the verified token
+value can declare it via ``Depends(verify_token)``.
+
+Dev-mode bypass: if no token file exists, authentication is disabled
+and the dependency passes through with an empty token string.
+"""
 
 from __future__ import annotations
+
+from typing import Optional
 
 from fastapi import HTTPException, Request, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from coding_agents.auth import validate_token
+from coding_agents.auth import load_token, validate_token
 
 security = HTTPBearer(auto_error=False)
 
 
+def _get_token_path(request: Request) -> Optional[str]:
+    """Extract the token path from request.app.state, if set.
+
+    The server sets ``app.state.token_path`` when a custom token path is
+    configured. If not set, returns None to use the default path.
+    """
+    return getattr(request.app.state, "token_path", None)
+
+
 async def verify_token(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Security(security),
 ) -> str:
     """Verify Bearer token against the stored token file.
 
+    Dev-mode bypass: when the token file does not exist (``load_token()``
+    returns ``None``), authentication is disabled and the dependency
+    passes through unconditionally. The middleware performs the same
+    check at the HTTP layer; this keeps the route-level dependency
+    consistent with it.
+
     Args:
+        request: The FastAPI request object (used to access app.state.token_path).
         credentials: HTTP Bearer credentials from the request.
 
     Returns:
-        The validated token string.
+        The validated token string, or ``""`` in dev mode (no token file).
 
     Raises:
-        HTTPException: If credentials are missing or invalid.
+        HTTPException: If credentials are missing or invalid (and a token
+            file exists).
     """
+    token_path = _get_token_path(request)
+
+    # Dev-mode bypass: no token file → auth disabled.
+    if load_token(token_path) is None:
+        return credentials.credentials if credentials else ""
+
     if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -32,7 +66,7 @@ async def verify_token(
         )
 
     token = credentials.credentials
-    if not validate_token(token):
+    if not validate_token(token, token_path):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token",

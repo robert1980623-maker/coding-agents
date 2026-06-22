@@ -43,6 +43,19 @@ class TestGetTokenPath:
         assert "~" not in str(path)
         assert path.is_absolute()
 
+    def test_env_var_fallback(self, tmp_path: Path, monkeypatch):
+        env_path = str(tmp_path / "env-token")
+        monkeypatch.setenv("CODING_AGENTS_TOKEN_PATH", env_path)
+        path = get_token_path()
+        assert str(path) == env_path
+
+    def test_explicit_path_overrides_env_var(self, tmp_path: Path, monkeypatch):
+        env_path = str(tmp_path / "env-token")
+        explicit_path = str(tmp_path / "explicit-token")
+        monkeypatch.setenv("CODING_AGENTS_TOKEN_PATH", env_path)
+        path = get_token_path(explicit_path)
+        assert str(path) == explicit_path
+
 
 class TestEnsureToken:
     def test_creates_token_file(self, tmp_path: Path):

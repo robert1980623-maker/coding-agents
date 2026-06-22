@@ -1,0 +1,239 @@
+"""Tests for HTTP authentication middleware.
+
+These tests focus specifically on the BearerTokenMiddleware behavior:
+- Public paths (/health) bypass auth
+- All other paths require a valid Bearer token
+- Missing-token dev-mode bypass (with warning)
+- Invalid / missing Authorization headers return 401
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+import httpx
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from coding_agents.auth import ensure_token, load_token
+from coding_agents.http.middleware import BearerTokenMiddleware, reset_dev_mode_warning
+from coding_agents.http.server import create_app
+from coding_agents.storage.sqlite import SQLiteStorage
+
+
+@pytest.fixture
+async def storage(tmp_path: Path) -> SQLiteStorage:
+    """Create a test storage instance."""
+    db_path = tmp_path / "test.db"
+    store = SQLiteStorage(str(db_path))
+    await store.initialize()
+    return store
+
+
+@pytest.fixture
+async def app(storage: SQLiteStorage):
+    """Create a test FastAPI app with middleware."""
+    test_app = create_app(db_path=str(storage._db_path))
+
+    # Override the storage dependency
+    async def get_test_storage() -> SQLiteStorage:
+        return storage
+
+    test_app.dependency_overrides[SQLiteStorage] = get_test_storage
+    return test_app
+
+
+@pytest.fixture(autouse=True)
+def _reset_dev_mode_warning():
+    """Reset the one-shot dev-mode warning before each test."""
+    reset_dev_mode_warning()
+    yield
+    reset_dev_mode_warning()
+
+
+def _client(app, headers: dict[str, str] | None = None) -> AsyncClient:
+    """Create a test client with optional auth headers."""
+    transport = ASGITransport(app=app)
+    return AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers=headers or {},
+    )
+
+
+class TestHealthBypass:
+    """/health must bypass auth entirely."""
+
+    async def test_health_no_auth_required(self, app):
+        """GET /health should return 200 even without Authorization."""
+        async with _client(app) as client:
+            response = await client.get("/health")
+        assert response.status_code == 200
+        assert response.json()["status"] == "healthy"
+
+    async def test_health_with_invalid_auth_still_works(self, app):
+        """/health ignores even invalid tokens — it's fully public."""
+        async with _client(app, {"Authorization": "Bearer garbage"}) as client:
+            response = await client.get("/health")
+        assert response.status_code == 200
+
+
+class TestTokenRequired:
+    """Non-public endpoints must require a valid Bearer token."""
+
+    async def test_missing_auth_returns_401(self, app):
+        """Request without Authorization header → 401."""
+        async with _client(app) as client:
+            response = await client.get("/sessions")
+        assert response.status_code == 401
+        assert "Missing authorization" in response.json()["detail"]
+
+    async def test_wrong_scheme_returns_401(self, app):
+        """Non-Bearer auth schemes (e.g. Basic) → 401."""
+        async with _client(app, {"Authorization": "Basic dXNlcjpwYXNz"}) as client:
+            response = await client.get("/sessions")
+        assert response.status_code == 401
+
+    async def test_bearer_without_token_returns_401(self, app, monkeypatch, tmp_path):
+        """``Authorization: Bearer `` with empty token → 401."""
+        # Ensure a token file exists so dev-mode bypass doesn't kick in
+        token_path = tmp_path / "token"
+        ensure_token(str(token_path))
+        monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(token_path))
+
+        async with _client(app, {"Authorization": "Bearer "}) as client:
+            response = await client.get("/sessions")
+        assert response.status_code == 401
+
+    async def test_invalid_token_returns_401(self, app, monkeypatch, tmp_path):
+        """Wrong token → 401."""
+        token_path = tmp_path / "token"
+        ensure_token(str(token_path))
+        monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(token_path))
+
+        async with _client(app, {"Authorization": "Bearer wrong-token"}) as client:
+            response = await client.get("/sessions")
+        assert response.status_code == 401
+        assert "Invalid token" in response.json()["detail"]
+
+    async def test_valid_token_returns_200(self, app, monkeypatch, tmp_path):
+        """Correct token → 200."""
+        token_path = tmp_path / "token"
+        token = ensure_token(str(token_path))
+        monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(token_path))
+
+        async with _client(app, {"Authorization": f"Bearer {token}"}) as client:
+            response = await client.get("/sessions")
+        assert response.status_code == 200
+
+
+class TestMetricsAuth:
+    """/metrics is NOT public — it requires auth like any other endpoint.
+
+    Prometheus scrapers should be configured with the Bearer token.
+    """
+
+    async def test_metrics_requires_auth(self, app, monkeypatch, tmp_path):
+        """GET /metrics without token → 401."""
+        token_path = tmp_path / "token"
+        ensure_token(str(token_path))
+        monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(token_path))
+
+        async with _client(app) as client:
+            response = await client.get("/metrics")
+        assert response.status_code == 401
+
+    async def test_metrics_with_valid_token(self, app, monkeypatch, tmp_path):
+        """GET /metrics with valid token → 200."""
+        token_path = tmp_path / "token"
+        token = ensure_token(str(token_path))
+        monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(token_path))
+
+        async with _client(app, {"Authorization": f"Bearer {token}"}) as client:
+            response = await client.get("/metrics")
+        assert response.status_code == 200
+
+
+class TestDevModeBypass:
+    """If the token file does not exist, auth is skipped (dev mode)."""
+
+    async def test_no_token_file_skips_auth(self, app, monkeypatch, tmp_path):
+        """When no token file exists, requests pass through without auth."""
+        # Point at a path that definitely doesn't exist
+        nonexistent = tmp_path / "does-not-exist-token"
+        assert not nonexistent.exists()
+        monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(nonexistent))
+
+        # Sanity: load_token returns None for missing file
+        assert load_token(str(nonexistent)) is None
+
+        async with _client(app) as client:
+            response = await client.get("/sessions")
+
+        # Auth bypassed → 200 (empty list)
+        assert response.status_code == 200
+        assert response.json() == []
+
+    async def test_dev_mode_warning_logged_once(self, app, monkeypatch, tmp_path, caplog):
+        """The dev-mode warning should fire at most once per process."""
+        nonexistent = tmp_path / "no-token-here"
+        monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(nonexistent))
+
+        with caplog.at_level(logging.WARNING, logger="coding_agents.http.middleware"):
+            async with _client(app) as client:
+                await client.get("/sessions")
+                await client.get("/sessions")
+                await client.get("/sessions")
+
+        # The warning should appear exactly once across 3 requests
+        warn_count = sum(
+            1 for r in caplog.records if "auth_disabled_no_token_file" in r.getMessage()
+        )
+        assert warn_count == 1, (
+            f"expected 1 warning, got {warn_count}.\n"
+            f"Records: {[r.getMessage() for r in caplog.records]}"
+        )
+
+    async def test_health_not_affected_by_dev_mode(self, app, monkeypatch, tmp_path):
+        """/health works regardless of token file existence."""
+        nonexistent = tmp_path / "no-token"
+        monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(nonexistent))
+
+        async with _client(app) as client:
+            response = await client.get("/health")
+        assert response.status_code == 200
+
+
+class TestAllEndpointsProtected:
+    """Spot-check that every route category goes through auth."""
+
+    @pytest.mark.parametrize(
+        "method,path",
+        [
+            ("GET", "/sessions"),
+            ("POST", "/sessions"),
+            ("GET", "/sessions/any-id"),
+            ("GET", "/sessions/any-id/events"),
+            ("GET", "/sessions/any-id/events/stream"),
+            ("GET", "/sessions/any-id/tags"),
+            ("POST", "/sessions/any-id/tags"),
+            ("DELETE", "/sessions/any-id/tags/foo"),
+            ("POST", "/sessions/any-id/kill"),
+            ("POST", "/recover"),
+            ("GET", "/metrics"),
+        ],
+    )
+    async def test_endpoint_requires_auth(
+        self, app, monkeypatch, tmp_path, method: str, path: str
+    ):
+        """Each endpoint should return 401 without a valid token."""
+        token_path = tmp_path / "token"
+        ensure_token(str(token_path))
+        monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(token_path))
+
+        async with _client(app) as client:
+            response = await client.request(method, path)
+        assert response.status_code == 401, (
+            f"{method} {path} returned {response.status_code}, expected 401"
+        )

@@ -22,13 +22,18 @@ TOKEN_LENGTH_BYTES = 32  # 256-bit token
 def get_token_path(explicit_path: Optional[str] = None) -> Path:
     """Resolve the token file path.
 
+    Resolution order:
+    1. ``explicit_path`` argument (e.g. from ``--auth-token-file``).
+    2. ``CODING_AGENTS_TOKEN_PATH`` environment variable.
+    3. ``DEFAULT_TOKEN_PATH`` (``~/.coding-agents-token``).
+
     Args:
-        explicit_path: User-provided path. Falls back to DEFAULT_TOKEN_PATH.
+        explicit_path: User-provided path. Takes highest precedence.
 
     Returns:
         Resolved Path object.
     """
-    raw = explicit_path or DEFAULT_TOKEN_PATH
+    raw = explicit_path or os.environ.get("CODING_AGENTS_TOKEN_PATH") or DEFAULT_TOKEN_PATH
     return Path(raw).expanduser().resolve()
 
 
