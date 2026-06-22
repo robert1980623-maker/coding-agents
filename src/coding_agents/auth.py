@@ -96,10 +96,19 @@ def ensure_token(token_path: Optional[str] = None) -> str:
             return existing
         # File exists but is empty/unreadable — regenerate ours.
         # This is rare; a second race here is acceptable.
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(token + "\n")
-        fd = -1  # fdopen consumed the fd.
+        inner_fd = -1
+        try:
+            inner_fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(inner_fd, "w") as f:
+                f.write(token + "\n")
+            inner_fd = -1  # fdopen consumed the fd.
+        except BaseException:
+            if inner_fd >= 0:
+                try:
+                    os.close(inner_fd)
+                except OSError:
+                    pass
+            raise
     except BaseException:
         # If os.fdopen fails the fd is NOT consumed — close it to avoid
         # leaking. (Once fdopen succeeds, the with-block owns the fd and
