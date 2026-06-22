@@ -16,6 +16,12 @@ uninstall() {
 install() {
     echo "Installing coding-agents..."
     
+    # Uninstall existing installation if present
+    if [ -f "${INSTALL_DIR}/coding-agents" ]; then
+        echo "Found existing installation, uninstalling first..."
+        rm -f "${INSTALL_DIR}/coding-agents"
+    fi
+    
     # Check if uv is available
     if ! command -v uv &> /dev/null; then
         echo "Error: uv is required but not installed."
