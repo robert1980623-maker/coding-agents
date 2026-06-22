@@ -14,6 +14,7 @@ Async Python SDK for the [coding-agents](https://github.com/coding-agents/coding
 - **Pure HTTP** — no subprocess management, no execution semantics
 - **Pydantic models** — strongly typed `Session`, `Event`, `Tag`, …
 - **SSE streaming** — `async for event in client.stream_events(...)`
+- **High-level helpers** — `wait_for_completion` and `watch_session` for polling loops
 - **Zero coupling** — independent Pydantic models; does not import the server's internals
 
 ## Installation
@@ -49,19 +50,81 @@ async def main() -> None:
         )
         print(f"Created session {session.session_id} (status={session.status})")
 
-        # 2. Poll status (or use stream_events)
-        current = await client.get_session(session.session_id)
-        print(f"Current status: {current.status}")
-
-        # 3. Attach a tag
-        await client.create_tag(session.session_id, "important")
-
-        # 4. Kill if needed
-        # await client.kill(session.session_id)
+        # 2. Wait for it to finish (polls every 5 min by default)
+        final = await client.wait_for_completion(
+            session.session_id,
+            poll_interval=10.0,  # check more often for demo purposes
+        )
+        print(f"Final status: {final.status}")
 
 
 asyncio.run(main())
 ```
+
+## Configuration
+
+`AsyncCodingAgentClient` accepts the following arguments at construction time:
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `base_url` | `str` | `http://localhost:8765` | Root URL of the coding-agents server |
+| `token` | `str \| None` | env `CODING_AGENTS_TOKEN` | Bearer token for authentication |
+| `timeout` | `float` | `30.0` | Per-request timeout in seconds |
+| `client` | `httpx.AsyncClient \| None` | `None` | Externally-managed HTTP client (optional) |
+
+The client is an async context manager and owns its internal `httpx.AsyncClient` by default. Pass an externally-managed client via `client=...` to share it (e.g. across tests):
+
+```python
+async with httpx.AsyncClient(timeout=10) as http:
+    client = AsyncCodingAgentClient(client=http, token="...")
+    # SDK will NOT close `http` on exit
+```
+
+## API reference
+
+### Sessions
+
+| Method | HTTP | Notes |
+| --- | --- | --- |
+| `create_session(agent, prompt="", *, workdir=".", metadata=None)` | `POST /sessions` | Returns a `pending` session. Does NOT execute. |
+| `get_session(session_id)` | `GET /sessions/{id}` | |
+| `list_sessions(*, agent=None, status=None, tag=None, limit=100)` | `GET /sessions` | |
+
+### Events
+
+| Method | HTTP | Notes |
+| --- | --- | --- |
+| `get_events(session_id, *, after_seq=0, limit=None)` | `GET /sessions/{id}/events` | JSON-decodes `data` when possible. |
+| `stream_events(session_id, *, last_event_id=None, timeout=None)` | `GET /sessions/{id}/events/stream` | Async iterator over `Event`. |
+
+### Actions
+
+| Method | HTTP | Notes |
+| --- | --- | --- |
+| `kill(session_id)` | `POST /sessions/{id}/kill` | Only effective for `pending`/`running`. |
+| `recover(*, timeout_seconds=300)` | `POST /recover` | Marks orphans. |
+
+### Tags
+
+| Method | HTTP | Notes |
+| --- | --- | --- |
+| `create_tag(session_id, tag)` | `POST /sessions/{id}/tags` | Body: `{"tag": "..."}` |
+| `list_tags(session_id)` | `GET /sessions/{id}/tags` | Returns `list[str]`. |
+| `delete_tag(session_id, tag)` | `DELETE /sessions/{id}/tags/{tag}` | |
+
+### High-level helpers
+
+| Method | Notes |
+| --- | --- |
+| `wait_for_completion(session_id, *, poll_interval=300.0, timeout=3600.0)` | Block until terminal state (`completed`/`failed`/`killed`/`timeout`). Returns final `Session`. Raises `TimeoutError` on deadline. |
+| `watch_session(session_id, *, poll_interval=300.0, timeout=3600.0)` | Async iterator yielding the `Session` on every status change until terminal state. |
+
+### Health
+
+| Method | HTTP | Notes |
+| --- | --- | --- |
+| `health()` | `GET /health` | Returns `HealthStatus`. |
+| `metrics()` | `GET /metrics` | Returns raw Prometheus text. |
 
 ## Streaming events
 
@@ -77,46 +140,36 @@ async with AsyncCodingAgentClient(base_url="...") as client:
 The server emits `text/event-stream` over `GET /sessions/{id}/events/stream`.
 The SDK transparently parses `data: <json>` lines and decodes the JSON payload.
 
-## API reference
+## Error handling
 
-### `AsyncCodingAgentClient`
-
-| Method | HTTP | Notes |
-| --- | --- | --- |
-| `create_session(agent, prompt="", *, workdir=".", metadata=None)` | `POST /sessions` | Returns a `pending` session. Does NOT execute. |
-| `get_session(session_id)` | `GET /sessions/{id}` | |
-| `list_sessions(*, agent=None, status=None, tag=None, limit=100)` | `GET /sessions` | |
-| `get_events(session_id, *, after_seq=0, limit=None)` | `GET /sessions/{id}/events` | JSON-decodes `data` when possible. |
-| `stream_events(session_id, *, last_event_id=None)` | `GET /sessions/{id}/events/stream` | Async iterator over `Event`. |
-| `kill(session_id)` | `POST /sessions/{id}/kill` | Only effective for `pending`/`running`. |
-| `recover(*, timeout_seconds=300)` | `POST /recover` | Marks orphans. |
-| `create_tag(session_id, tag)` | `POST /sessions/{id}/tags` | Body: `{"tag": "..."}` |
-| `list_tags(session_id)` | `GET /sessions/{id}/tags` | Returns `list[str]`. |
-| `delete_tag(session_id, tag)` | `DELETE /sessions/{id}/tags/{tag}` | |
-| `health()` | `GET /health` | |
-| `metrics()` | `GET /metrics` | Returns raw Prometheus text. |
-
-### Context manager
-
-The client is an async context manager and owns its internal `httpx.AsyncClient` by default. Pass an externally-managed client via `client=...` to share it (e.g. across tests):
+All errors derive from `CodingAgentsSDKError`. Catch specific subclasses for finer-grained handling:
 
 ```python
-async with httpx.AsyncClient(timeout=10) as http:
-    client = AsyncCodingAgentClient(client=http, token="...")
-    # SDK will NOT close `http` on exit
+from coding_agents_sdk import (
+    AsyncCodingAgentClient,
+    APIError,
+    AuthenticationError,
+    NotFoundError,
+    ServerError,
+    ConnectionError_,
+)
+
+async with AsyncCodingAgentClient(base_url="...") as client:
+    try:
+        session = await client.get_session("does-not-exist")
+    except AuthenticationError as e:
+        print(f"Bad token: {e.detail}")            # 401
+    except NotFoundError as e:
+        print(f"Not found: {e.detail}")            # 404
+    except ServerError as e:
+        print(f"Server error: {e.status_code}")    # 5xx
+    except APIError as e:
+        print(f"API error: {e.status_code} — {e.detail}")  # other 4xx
+    except ConnectionError_ as e:
+        print(f"Transport failure: {e}")           # timeout / refused
 ```
 
-### Errors
-
-| Exception | HTTP |
-| --- | --- |
-| `AuthenticationError` | 401 |
-| `NotFoundError` | 404 |
-| `ServerError` | 5xx |
-| `APIError` | other 4xx |
-| `ConnectionError_` | transport failure (timeout, refused, …) |
-
-All exceptions expose `.status_code`, `.detail`, and `.response_body` where applicable.
+Every exception exposes `.status_code`, `.detail`, and `.response_body` where applicable.
 
 ## Testing
 

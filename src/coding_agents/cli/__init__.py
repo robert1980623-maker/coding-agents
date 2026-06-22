@@ -77,6 +77,7 @@ from coding_agents.cli import resume as _resume_mod  # noqa: E402
 from coding_agents.cli import run as _run_mod  # noqa: E402
 from coding_agents.cli import server as _server_mod  # noqa: E402
 from coding_agents.cli import tags as _tags_mod  # noqa: E402
+from coding_agents.cli import watch as _watch_mod  # noqa: E402
 
 _run_mod.register(app)
 _inspect_mod.register(app)
@@ -85,6 +86,7 @@ _tags_mod.register(app)
 _poll_mod.register(app)
 _server_mod.register(app)
 _resume_mod.register(app)
+_watch_mod.register(app)
 
 
 # Register skill sub-commands
