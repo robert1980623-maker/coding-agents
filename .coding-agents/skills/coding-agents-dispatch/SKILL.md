@@ -107,6 +107,57 @@ coding-agents tail $SID --limit 500  # bigger window
    it overflowed the OpenClaw exec buffer. Read events from SQLite
    instead (`status` / `tail`).
 
+## Concurrency & timeout (CORE strategy, v0.2.29+)
+
+Two non-negotiable rules, agreed with the model provider (DashScope
+Alibaba proxy) to avoid 429 quota errors:
+
+### 1. **Never dispatch in parallel** — run sequentially
+
+```bash
+# ❌ DO NOT do this
+coding-agents dispatch-bg claude "task A" --workdir /path &
+coding-agents dispatch-bg claude "task B" --workdir /path &
+
+# ✅ DO this — chain with &&
+coding-agents dispatch-bg claude "task A" --workdir /path
+coding-agents status <A-id>   # wait for A to complete
+coding-agents dispatch-bg claude "task B" --workdir /path
+```
+
+Why:
+- The DashScope proxy has hard concurrency limits; parallel dispatches
+  collide and return 429 / "Not logged in"
+- Single-stream is also easier to debug and reason about
+- For multi-task work, prefer breaking it into clear, ordered phases
+  rather than racing them
+
+### 2. **Keep tasks ≤ 10 minutes**
+
+```bash
+# ✅ Default timeout is 10 min — fine for most tasks
+coding-agents dispatch-bg claude "fix the race condition" --workdir /path
+
+# ⚠️ Long analysis? Add --idle-timeout (Codex may go silent on big files)
+coding-agents dispatch-bg codex "analyze the whole repo" --workdir /path --idle-timeout 900
+
+# ❌ DO NOT do this — a single 60-minute task
+coding-agents dispatch-bg claude "rewrite the entire codebase"
+```
+
+If a task would exceed 10 minutes:
+- **Split it** into smaller, scoped dispatches (preferred)
+- Add `--idle-timeout` to defend against silent stalls
+- Do NOT raise the cap; long tasks are usually a sign the prompt
+  is too broad or the work is not yet understood
+
+### Why these two rules together
+
+The 10-minute cap + sequential execution means a typical
+"refactor / test / commit" cycle is one or two dispatches, never
+a firehose. This matches the provider's quota model and avoids
+the cascading failures we saw in 2026-Q2.
+
 ## Common mistakes to avoid
 
 | ❌ Don't | ✅ Do |
