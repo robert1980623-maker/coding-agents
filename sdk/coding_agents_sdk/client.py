@@ -16,6 +16,7 @@ import time
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -53,6 +54,41 @@ DEFAULT_RETRY_MAX_DELAY = 30.0  # seconds
 
 # Status codes that should trigger a retry with exponential backoff
 RETRYABLE_STATUS_CODES = {429, 503, 504}
+
+# Default path for the auth token file, mirroring
+# ``coding_agents.auth.DEFAULT_TOKEN_PATH``. The CLI writes the token here
+# via ``ensure_token()``; the server reads it from here via
+# ``BearerTokenMiddleware``; and the SDK client reads it here to obtain
+# the Bearer token automatically.
+DEFAULT_TOKEN_PATH = "~/.coding-agents-token"
+
+
+def _load_token_from_file(token_path: str | None = None) -> str | None:
+    """Read the auth token from the on-disk token file.
+
+    Resolution order (mirrors ``coding_agents.auth.get_token_path``):
+
+    1. ``token_path`` argument (explicit override).
+    2. ``CODING_AGENTS_TOKEN_PATH`` environment variable.
+    3. ``DEFAULT_TOKEN_PATH`` (``~/.coding-agents-token``).
+
+    Returns:
+        The stripped token string, or ``None`` if the file does not exist
+        (signalling that the caller should fall through to dev mode or
+        send no auth header). Returns ``None`` as well for an empty or
+        unreadable file — the server rejects these with a 500 anyway, so
+        the SDK surfaces the failure as a 401 at request time rather than
+        silently sending a broken header.
+    """
+    raw = token_path or os.environ.get("CODING_AGENTS_TOKEN_PATH") or DEFAULT_TOKEN_PATH
+    path = Path(raw).expanduser().resolve()
+    if not path.is_file():
+        return None
+    try:
+        content = path.read_text().strip()
+    except OSError:
+        return None
+    return content or None
 
 
 class CancelToken:
@@ -100,8 +136,21 @@ class AsyncCodingAgentClient:
         Root URL of the coding-agents HTTP server, e.g.
         ``http://localhost:8765``. No trailing slash required.
     token:
-        Bearer token for authentication. If ``None``, no ``Authorization``
-        header is sent (the server will reject with 401 — see plan v2).
+        Bearer token for authentication. If ``None``, the client resolves
+        the token in this order:
+
+        1. ``CODING_AGENTS_TOKEN`` environment variable (explicit value).
+        2. Token file — see ``token_path`` below.
+
+        If none of these yield a token, no ``Authorization`` header is
+        sent and the server will reject with 401 (or accept in dev mode
+        when no token file exists on the server side).
+    token_path:
+        Path to the auth token file on disk. Mirrors the server-side
+        resolution: the ``CODING_AGENTS_TOKEN_PATH`` environment variable
+        takes precedence, then ``~/.coding-agents-token``. Pass an
+        explicit path to override both. Only consulted when ``token``
+        and ``CODING_AGENTS_TOKEN`` are unset.
     timeout:
         Default per-request timeout in seconds. Defaults to 30s. Streaming
         endpoints override this with a longer timeout (see ``stream_events``).
@@ -131,6 +180,7 @@ class AsyncCodingAgentClient:
         base_url: str = DEFAULT_BASE_URL,
         token: str | None = None,
         *,
+        token_path: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         headers: dict[str, str] | None = None,
         client: httpx.AsyncClient | None = None,
@@ -139,7 +189,27 @@ class AsyncCodingAgentClient:
         retry_base_delay: float = DEFAULT_RETRY_BASE_DELAY,
         retry_max_delay: float = DEFAULT_RETRY_MAX_DELAY,
     ) -> None:
-        token = token or os.environ.get("CODING_AGENTS_TOKEN") or None
+        # Token resolution order:
+        # 1. Explicit ``token`` argument (highest precedence). An explicit
+        #    empty string means "do not authenticate" — we must NOT fall
+        #    through to file reading, which would silently re-enable auth.
+        # 2. ``CODING_AGENTS_TOKEN`` env var (legacy convenience for examples).
+        #    Same rule: empty value means "no auth", not "try the file".
+        # 3. Token file on disk — matches what the CLI generates and the
+        #    server validates. This lets the SDK work out-of-the-box when
+        #    the user has already run the CLI once, without requiring them
+        #    to manually copy the token into an env var.
+        if token is None:
+            env_token = os.environ.get("CODING_AGENTS_TOKEN")
+            if env_token:
+                token = env_token
+            else:
+                # Env var not set (or set to "") — try the token file.
+                # An empty env var means "no auth", so we only read the
+                # file when the var is truly unset (None).
+                if env_token is None:
+                    token = _load_token_from_file(token_path)
+                # else: env_token == "" → leave token as None (no auth).
         if client is None:
             merged_headers: dict[str, str] = dict(headers or {})
             if token:

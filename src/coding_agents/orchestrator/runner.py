@@ -141,8 +141,12 @@ async def _run_single_task(
     # Merge agent-specific env overrides (e.g. Codex needs real HOME
     # when the parent process redirects it, like Hermes profiles).
     overrides = agent.env_overrides()
+    deletions = agent.env_deletions()
     if overrides:
         config.env = {**config.env, **overrides}
+    # Delete problematic environment variables
+    for var in deletions:
+        config.env.pop(var, None)
 
     command = agent.build_command(task.prompt, config)
 

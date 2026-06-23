@@ -96,14 +96,11 @@ class ClaudeAgent(BaseAgent):
         return None
 
     def env_overrides(self) -> dict[str, str]:
-        """Ensure HOME points to the real user home and strip DashScope vars.
+        """Ensure HOME points to the real user home.
 
         Claude Code resolves ``~/.claude/`` config/skills via HOME.
         When the parent process (e.g. Hermes with profiles) redirects HOME
         to a profile directory, Claude Code cannot find its config.
-
-        Also strips DashScope environment variables that can interfere with
-        Claude Code's connection to the native Anthropic API.
         """
         overrides = {}
         real_home = _get_real_home()
@@ -116,11 +113,17 @@ class ClaudeAgent(BaseAgent):
             )
             overrides["HOME"] = real_home
 
-        # Strip DashScope environment variables that can interfere with Claude Code
-        # These cause Claude Code to route through DashScope proxy instead of native Anthropic API
+        return overrides
+
+    def env_deletions(self) -> list[str]:
+        """Strip DashScope environment variables.
+
+        These cause Claude Code to route through DashScope proxy instead of
+        native Anthropic API, breaking authentication.
+        """
         dashscope_vars = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_MODEL']
+        to_delete = []
         for var in dashscope_vars:
             if os.environ.get(var, '').lower().find('dashscope') != -1:
-                overrides[var] = ""  # Set to empty string to override
-
-        return overrides
+                to_delete.append(var)
+        return to_delete

@@ -34,3 +34,13 @@ class BaseAgent(ABC):
         overrides.
         """
         return {}
+
+    def env_deletions(self) -> list[str]:
+        """Return environment variable names to delete for the agent subprocess.
+
+        Subclasses override this to remove problematic environment variables
+        that should not be inherited by the agent subprocess (e.g. DashScope
+        vars that interfere with Claude Code's API connection). Default: no
+        deletions.
+        """
+        return []

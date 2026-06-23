@@ -395,6 +395,7 @@ class TestAllEndpointsProtected:
             ("POST", "/sessions/any-id/tags"),
             ("DELETE", "/sessions/any-id/tags/foo"),
             ("POST", "/sessions/any-id/kill"),
+            ("POST", "/sessions/any-id/resume"),
             ("POST", "/recover"),
             ("GET", "/metrics"),
         ],
@@ -412,3 +413,41 @@ class TestAllEndpointsProtected:
         assert response.status_code == 401, (
             f"{method} {path} returned {response.status_code}, expected 401"
         )
+
+
+class TestVerifyTokenWithoutMiddleware:
+    """verify_token must raise 401 if the middleware didn't set auth_token."""
+
+    async def test_raises_when_auth_token_not_set(self):
+        """If auth_token was never placed on request.state, verify_token
+        must reject the request rather than silently returning ''."""
+        from fastapi import APIRouter, Depends, FastAPI
+        from fastapi.testclient import TestClient
+
+        from coding_agents.http.auth import verify_token
+
+        bare_app = FastAPI()
+        router = APIRouter()
+
+        @router.get("/test")
+        async def test_route(token: str = Depends(verify_token)):
+            return {"token": token}
+
+        bare_app.include_router(router)
+        # No BearerTokenMiddleware — simulates a route that bypasses
+        # the middleware (e.g. mounted on a different app).
+        client = TestClient(bare_app)
+        response = client.get("/test")
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Authentication required"
+
+    async def test_dev_mode_still_passes(self, app, monkeypatch, tmp_path):
+        """Dev mode (no token file) sets auth_token='' — must still pass."""
+        token_path = tmp_path / "token"
+        # Don't create the file → dev mode
+        monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(token_path))
+
+        async with _client(app) as client:
+            response = await client.get("/sessions")
+        # Should NOT be 401 — dev mode disables auth with a warning
+        assert response.status_code != 401

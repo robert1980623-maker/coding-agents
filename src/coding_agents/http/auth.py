@@ -12,11 +12,16 @@ between the middleware read and this read, causing false 401s).
 
 Dev-mode bypass: if no token file exists, the middleware sets
 ``auth_token=""`` and this dependency returns ``""`` without error.
+
+Safety net: if ``auth_token`` was never set (e.g. the middleware didn't
+run because a route was mounted on a different app, or a future refactor
+accidentally skips it), this dependency raises 401 rather than silently
+returning ``""`` and allowing unauthenticated access.
 """
 
 from __future__ import annotations
 
-from fastapi import Request
+from fastapi import HTTPException, Request, status
 
 
 async def verify_token(request: Request) -> str:
@@ -27,17 +32,24 @@ async def verify_token(request: Request) -> str:
     stores the result in ``request.state.auth_token``:
 
     * ``str`` (non-empty) → validated token.
-    * ``""`` → dev mode (no token file) or the token itself is empty.
-      Either way, the middleware already decided this is acceptable.
-
-    If ``auth_token`` is not set, the middleware didn't run on this
-    request (e.g. route mounted without the middleware). In that case,
-    we cannot verify the token — return ``""`` rather than raising, so
-    callers get a consistent "unverified" sentinel.
+    * ``""`` → dev mode (no token file) — auth is disabled.
+    * *not set* → middleware did not run → raise 401.
 
     Returns:
-        The validated token string, or ``""`` in dev mode / unverified.
+        The validated token string, or ``""`` in dev mode.
+
+    Raises:
+        HTTPException: 401 if the middleware did not set ``auth_token``
+            (i.e. it didn't run on this request).
     """
-    # The middleware sets this after successful validation.
-    # "" means dev mode (no token file) — auth is disabled.
-    return getattr(request.state, "auth_token", "")
+    # Use None as the sentinel so we can distinguish "middleware didn't
+    # run" (auth bypass — must reject) from "dev mode" (auth disabled
+    # intentionally — token is "").
+    token = getattr(request.state, "auth_token", None)
+    if token is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return token

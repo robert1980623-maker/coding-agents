@@ -45,6 +45,9 @@ def run(
     workdir: str = typer.Option(".", help="Working directory for the agent"),
     model: Optional[str] = typer.Option(None, help="Model override"),
     budget: Optional[float] = typer.Option(None, help="Max budget in USD"),
+    idle_timeout: Optional[int] = typer.Option(
+        None, "--idle-timeout", help="Idle timeout in seconds (default: 300). Kill session if no output for this duration."
+    ),
     output_mode: str = typer.Option("standard", help="Output mode: standard or passthrough"),
     verbose: bool = typer.Option(False, help="Verbose output"),
 ) -> None:
@@ -56,7 +59,7 @@ def run(
         stacklevel=2,
     )
     from coding_agents.cli._utils import _run_async
-    _run_async(_run_session(agent, prompt, workdir, model, budget, output_mode, verbose))
+    _run_async(_run_session(agent, prompt, workdir, model, budget, output_mode, verbose, idle_timeout=idle_timeout))
 
 
 def dispatch(
@@ -71,6 +74,9 @@ def dispatch(
     ),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Model override"),
     budget: Optional[float] = typer.Option(None, "--budget", "-b", help="Max budget in USD"),
+    idle_timeout: Optional[int] = typer.Option(
+        None, "--idle-timeout", help="Idle timeout in seconds (default: 300). Kill session if no output for this duration."
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ) -> None:
     """Dispatch a coding agent session in the current project.
@@ -94,7 +100,7 @@ def dispatch(
     effective_workdir = workdir or "."
     from coding_agents.cli._utils import _run_async
     _run_async(
-        _run_session(agent, prompt, effective_workdir, model, budget, "standard", verbose)
+        _run_session(agent, prompt, effective_workdir, model, budget, "standard", verbose, idle_timeout=idle_timeout)
     )
 
 
@@ -108,6 +114,9 @@ def dispatch_bg(
     ),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Model override"),
     budget: Optional[float] = typer.Option(None, "--budget", "-b", help="Max budget in USD"),
+    idle_timeout: Optional[int] = typer.Option(
+        None, "--idle-timeout", help="Idle timeout in seconds (default: 300). Kill session if no output for this duration."
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ) -> None:
     """Dispatch a coding agent in fire-and-forget mode.
@@ -128,7 +137,7 @@ def dispatch_bg(
     effective_workdir = workdir or "."
     from coding_agents.cli._utils import _run_async
     _run_async(
-        _dispatch_bg_setup(agent, prompt, effective_workdir, model, budget, verbose)
+        _dispatch_bg_setup(agent, prompt, effective_workdir, model, budget, verbose, idle_timeout=idle_timeout)
     )
 
 
@@ -138,6 +147,7 @@ def bg_runner(
     workdir: str = typer.Argument(..., help="Working directory"),
     model: str = typer.Argument("", help="Model override (empty = none)"),
     budget: str = typer.Argument("", help="Max budget (empty = none)"),
+    idle_timeout: str = typer.Argument("", help="Idle timeout in seconds (empty = 300)"),
 ) -> None:
     """Internal: detached runner that executes a session.
 
@@ -150,6 +160,7 @@ def bg_runner(
     """
     budget_val = float(budget) if budget else None
     model_val = model or None
+    idle_timeout_val = int(idle_timeout) if idle_timeout else None
     from coding_agents.cli._utils import _run_async
     _run_async(
         _run_session(
@@ -160,6 +171,7 @@ def bg_runner(
             budget_val,
             "standard",
             False,
+            idle_timeout=idle_timeout_val,
             existing_session_id=session_id,
         )
     )
@@ -192,6 +204,7 @@ async def _dispatch_bg_setup(
     model: Optional[str],
     budget: Optional[float],
     verbose: bool,
+    idle_timeout: Optional[int] = None,
 ) -> None:
     """Set up a session and spawn a detached runner subprocess.
 
@@ -209,6 +222,7 @@ async def _dispatch_bg_setup(
     # Get agent adapter and its env overrides to apply before spawning subprocess
     adapter = get_agent(agent_type)
     overrides = adapter.env_overrides()
+    deletions = adapter.env_deletions()
 
     storage = _get_storage()
     await storage.initialize()
@@ -237,22 +251,25 @@ async def _dispatch_bg_setup(
         workdir,
         model or "",
         str(budget) if budget is not None else "",
+        str(idle_timeout) if idle_timeout is not None else "",
     ]
     if verbose:
         console.print(f"[dim]spawning runner: {' '.join(runner_argv)}[/dim]")
     try:
-        # Start with the current environment
+        # Start with the current environment and apply agent-specific overrides.
         env = {**os.environ, "CODING_AGENTS_BG_RUNNER": "1"}
-
-        # Apply agent-specific overrides
         env.update(overrides)
 
-        # Additionally, specifically for Claude agent, ensure DashScope vars are cleared
-        if agent_type == AgentType.CLAUDE:
-            dashscope_vars = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_MODEL']
-            for var in dashscope_vars:
-                if env.get(var, '').lower().find('dashscope') != -1:
-                    env[var] = ""  # Clear the DashScope variable
+        # Delete problematic environment variables (e.g. DashScope vars for Claude)
+        for var in deletions:
+            env.pop(var, None)
+
+        # Pin the DB path so the runner uses the same database as the wrapper.
+        # Without this, env overrides (e.g. HOME→real_home for Codex/Claude)
+        # cause the runner to resolve ~/.coding-agents/data.db differently
+        # than the wrapper, leading to "Session not found" crashes.
+        from coding_agents.cli._utils import DEFAULT_DB as _DEFAULT_DB
+        env.setdefault("CODING_AGENTS_DB", os.path.expanduser(_DEFAULT_DB))
 
         proc = subprocess.Popen(
             runner_argv,
@@ -301,6 +318,7 @@ async def _run_session(
     budget: Optional[float],
     output_mode: str,
     verbose: bool,
+    idle_timeout: Optional[int] = None,
     existing_session_id: Optional[str] = None,
 ) -> None:
     """Run the agent subprocess and persist events to SQLite.
@@ -332,11 +350,19 @@ async def _run_session(
         max_budget_usd=budget,  # None means "no cap"; agents honor or warn
     )
 
+    # Update config with idle_timeout if provided
+    if idle_timeout is not None:
+        config.idle_timeout_seconds = idle_timeout
+
     # Merge agent-specific env overrides (e.g. Codex needs real HOME
     # when the parent process redirects it, like Hermes profiles).
     overrides = adapter.env_overrides()
+    deletions = adapter.env_deletions()
     if overrides:
         config.env = {**config.env, **overrides}
+    # Delete problematic environment variables
+    for var in deletions:
+        config.env.pop(var, None)
 
     command = adapter.build_command(prompt, config)
     if verbose:
