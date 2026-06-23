@@ -1,6 +1,6 @@
 [project]
 name = "coding-agents"
-version = "0.2.26"
+version = "0.2.27"
 description = "A unified runtime for managing coding agents (Claude Code, Codex, etc.)"
 readme = "README.md"
 requires-python = ">=3.12"
