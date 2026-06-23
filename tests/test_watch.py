@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -16,6 +17,17 @@ from coding_agents.storage.sqlite import SQLiteStorage
 
 
 runner = CliRunner()
+
+
+async def _fast_sleep(_seconds: float) -> None:
+    """Test helper: instant sleep so the watch tests don't wait minutes.
+
+    Must NOT call asyncio.sleep itself — this helper is used to
+    patch coding_agents.cli.watch.asyncio.sleep, so any nested
+    asyncio.sleep call would recurse into the patched version.
+    """
+    return None
+
 
 
 @pytest.fixture
@@ -57,52 +69,35 @@ class TestWatchCommand:
         """Watching a session that transitions from pending → running → completed."""
         sid = asyncio.run(_create_session(mock_db, SessionStatus.PENDING))
 
-        # Simulate status transitions in a background thread
-        transitions_done = asyncio.Event()
+        # Simulate status transitions in a background thread.
+        # v0.2.30+: We use time.sleep (not asyncio.sleep) here so
+        # the patch on coding_agents.cli.watch.asyncio.sleep
+        # doesn't affect the bg thread's sleep.
 
-        async def _transition():
-            await asyncio.sleep(0.3)  # Let watch start polling
+        def _bg_transition() -> None:
+            # Pre-set to running so watch sees it on the first poll
+            asyncio.run(_update_status(sid, SessionStatus.RUNNING))
+            time.sleep(0.3)  # let watch print the initial status
+            # Then transition to completed
+            asyncio.run(_update_status(sid, SessionStatus.COMPLETED))
+
+        async def _update_status(session_id: str, status: SessionStatus) -> None:
             store = SQLiteStorage(mock_db)
             await store.initialize()
-            await store.update_session(sid, status=SessionStatus.RUNNING)
-            await asyncio.sleep(0.3)
-            await store.update_session(sid, status=SessionStatus.COMPLETED)
+            await store.update_session(session_id, status=status)
             await store.close()
-
-        # Run transitions concurrently with watch
-        async def _run_both():
-            task = asyncio.create_task(_transition())
-            # We can't directly invoke the CLI in async, but we can test
-            # the underlying logic via the storage layer
-            await task
-
-        # For the CLI test, we pre-transition the session
-        async def _setup_and_run():
-            store = SQLiteStorage(mock_db)
-            await store.initialize()
-            await store.update_session(sid, status=SessionStatus.RUNNING)
-            await store.close()
-
-        asyncio.run(_setup_and_run())
-
-        # Now watch with a short interval; the session is running, will
-        # transition to completed via a background task. Use threading to
-        # drive the transition while watch polls.
-        import threading
-
-        def _bg_transition():
-            async def _inner():
-                await asyncio.sleep(0.2)
-                store = SQLiteStorage(mock_db)
-                await store.initialize()
-                await store.update_session(sid, status=SessionStatus.COMPLETED)
-                await store.close()
-            asyncio.run(_inner())
 
         thread = threading.Thread(target=_bg_transition)
         thread.start()
 
-        result = runner.invoke(app, ["watch", sid, "--interval", "1", "--timeout", "5"])
+        # v0.2.30+: minimum interval is 300s. The CLI check is
+        # done up-front via _validate_interval. We patch the validator
+        # to allow short intervals in tests, and mock asyncio.sleep in
+        # the watch module so the test doesn't actually wait 5 minutes
+        # for the second poll cycle.
+        with patch("coding_agents.cli.watch._validate_interval"), \
+             patch("coding_agents.cli.watch.asyncio.sleep", new=_fast_sleep):
+            result = runner.invoke(app, ["watch", sid, "--interval", "1", "--timeout", "5"])
         thread.join(timeout=5)
 
         assert result.exit_code == 0
@@ -115,8 +110,12 @@ class TestWatchCommand:
     def test_watch_timeout_exits_with_code_1(self, mock_db: Path):
         """Watching a non-terminal session past the timeout should exit with code 1."""
         sid = asyncio.run(_create_session(mock_db, SessionStatus.RUNNING))
-        # Use a very short timeout so the test finishes quickly
-        result = runner.invoke(app, ["watch", sid, "--interval", "1", "--timeout", "1"])
+        # Use a very short timeout so the test finishes quickly.
+        # v0.2.30+: minimum interval is 300s enforced by _validate_interval;
+        # we patch the validator for testing and mock asyncio.sleep to instant.
+        with patch("coding_agents.cli.watch._validate_interval"), \
+             patch("coding_agents.cli.watch.asyncio.sleep", new=_fast_sleep):
+            result = runner.invoke(app, ["watch", sid, "--interval", "1", "--timeout", "1"])
         assert result.exit_code == 1
         assert "timeout" in result.stdout.lower()
 
@@ -137,14 +136,21 @@ class TestWatchCommand:
     def test_watch_interval_option_accepted(self, mock_db: Path):
         """The --interval option should be accepted without error."""
         sid = asyncio.run(_create_session(mock_db, SessionStatus.COMPLETED))
-        result = runner.invoke(app, ["watch", sid, "--interval", "60"])
+        result = runner.invoke(app, ["watch", sid, "--interval", "600"])
         assert result.exit_code == 0
 
     def test_watch_short_interval_option(self, mock_db: Path):
         """The -i short option for --interval should be accepted."""
         sid = asyncio.run(_create_session(mock_db, SessionStatus.COMPLETED))
-        result = runner.invoke(app, ["watch", sid, "-i", "60"])
+        result = runner.invoke(app, ["watch", sid, "-i", "600"])
         assert result.exit_code == 0
+
+    def test_watch_interval_below_minimum_rejected(self, mock_db: Path):
+        """v0.2.30+: --interval < 300s is rejected to enforce provider quota floor."""
+        sid = asyncio.run(_create_session(mock_db, SessionStatus.COMPLETED))
+        result = runner.invoke(app, ["watch", sid, "--interval", "60"])
+        assert result.exit_code != 0
+        assert "300" in result.stdout or "300" in (result.stderr or "")
 
     def test_watch_timeout_option_accepted(self, mock_db: Path):
         """The --timeout option should be accepted without error."""

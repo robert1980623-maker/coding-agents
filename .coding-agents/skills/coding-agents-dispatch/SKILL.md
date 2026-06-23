@@ -158,6 +158,30 @@ The 10-minute cap + sequential execution means a typical
 a firehose. This matches the provider's quota model and avoids
 the cascading failures we saw in 2026-Q2.
 
+### 3. **Polling interval must be > 5 minutes** (v0.2.30+)
+
+Same provider-quota reason. If you poll `status <id>` or `watch <id>`
+in a tight loop, you burn API quota the agent itself is using.
+
+```bash
+# ❌ DO NOT do this — 2s sleep hammers the provider
+while true; do coding-agents status <id>; sleep 2; done
+
+# ❌ DO NOT do this — even 1 minute is too short
+while true; do coding-agents status <id>; sleep 60; done
+
+# ✅ DO this — >= 5 min, default is 10 min
+coding-agents watch <id>                    # default --interval 600
+coding-agents watch <id> --interval 300     # minimum allowed
+
+# ✅ Manual loop with proper spacing
+while true; do coding-agents status <id>; sleep 600; done
+```
+
+The `watch` command enforces `--interval >= 300` (5 min) and
+defaults to 600 (10 min). If you find yourself wanting shorter
+intervals, the task is too long — split it.
+
 ## Common mistakes to avoid
 
 | ❌ Don't | ✅ Do |

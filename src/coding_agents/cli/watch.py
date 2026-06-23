@@ -14,11 +14,28 @@ def register(app: typer.Typer) -> None:
     app.command()(watch)
 
 
+def _validate_interval(interval: int) -> None:
+    """Enforce minimum 5-minute poll interval to avoid 429 on the provider.
+
+    v0.2.30+: extracted as a standalone function so tests can patch
+    the validation (the watch tests need fast intervals to finish in
+    reasonable time, but the production rule still applies).
+    """
+    if interval < 300:
+        raise typer.BadParameter(
+            f"Interval must be >= 300s (5 min); got {interval}s. "
+            f"Reason: short intervals hit provider rate limits (429). "
+            f"Use the default (600s) or a longer value."
+        )
+
+
 def watch(
     session_id: str = typer.Argument(..., help="Session ID to watch"),
     interval: int = typer.Option(
-        300, "--interval", "-i",
-        help="Polling interval in seconds (default: 300 = 5 minutes).",
+        600, "--interval", "-i",
+        help="Polling interval in seconds (default: 600 = 10 minutes, "
+             "minimum: 300 = 5 minutes). Shorter intervals waste API "
+             "quota and may hit provider rate limits.",
     ),
     timeout: int = typer.Option(
         3600, "--timeout", "-t",
@@ -34,7 +51,12 @@ def watch(
     Exits with code 0 when the session reaches a terminal state (completed,
     failed, killed, timeout, orphaned). Exits with code 1 if the --timeout
     is exceeded before reaching a terminal state.
+
+    v0.2.30+: minimum interval is 300s (5 minutes) per provider
+    (DashScope) quota guidance — shorter intervals hit 429.
     """
+    _validate_interval(interval)
+
     from coding_agents.cli._utils import _run_async, _get_storage, console
 
     async def _watch_impl() -> None:

@@ -51,6 +51,33 @@ coding-agents tail <session-id> --limit 500  # last 500
 
 Use `tail` when `status` doesn't give you enough context.
 
+### `coding-agents watch <session-id>` (v0.2.30+: poll interval floor)
+
+Continuously monitor a session until it reaches a terminal state.
+Prints status transitions with timestamps.
+
+```bash
+coding-agents watch <session-id>                    # default 10 min interval
+coding-agents watch <session-id> --interval 300     # minimum allowed
+coding-agents watch <session-id> --timeout 3600     # 1 hour max
+```
+
+**v0.2.30+ rule**: `--interval` must be **≥ 300s (5 min)**, default is
+**600s (10 min)**. Shorter intervals hit provider rate limits (429) and
+are rejected by the CLI. This applies whether you use `watch` or poll
+`status` in a manual loop:
+
+```bash
+# ✅ correct
+while true; do coding-agents status <id>; sleep 600; done
+
+# ❌ rejected
+while true; do coding-agents status <id>; sleep 60; done
+```
+
+If a session genuinely needs shorter polling, the task is too long —
+split it (see `coding-agents-dispatch` skill).
+
 ### `coding-agents gc`
 
 Garbage-collect old sessions to keep SQLite bounded.
