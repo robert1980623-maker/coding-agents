@@ -41,6 +41,8 @@ def enable_resume_support(agent: BaseAgent) -> BaseAgent:
         ).get("resume") if hasattr(config, "metadata") else None
 
         if resume_info and "session_id" in resume_info:
+            # Get session metadata if available in config
+            session_metadata = config.metadata.get("session_metadata", {}) if hasattr(config, "metadata") else {}
             cmd = build_resume_command(
                 cmd,
                 session_id=resume_info["session_id"],
@@ -51,6 +53,7 @@ def enable_resume_support(agent: BaseAgent) -> BaseAgent:
                     and config.metadata.get("agent_type")
                     else None
                 ),
+                session_metadata=session_metadata,
             )
         return cmd
 
@@ -63,6 +66,7 @@ def build_resume_command(
     session_id: str,
     last_seq: int,
     agent_type: Optional[AgentType] = None,
+    session_metadata: Optional[dict[str, Any]] = None,
 ) -> list[str]:
     """Build a command with resume arguments appended.
 
@@ -70,17 +74,37 @@ def build_resume_command(
     - Claude Code: ``--resume <session-id>``
     - Codex: ``--resume-from <seq>``
     - Generic fallback: ``--resume <session_id> --from-seq <last_seq>``
+
+    If session_metadata is provided and contains "native_session_id", that
+    will be used instead of the passed session_id for Claude Code and Codex.
     """
-    cmd = list(base_command)
+    # Use native session ID if available in metadata for backward compatibility
+    effective_session_id = session_id
+    if session_metadata and "native_session_id" in session_metadata:
+        effective_session_id = session_metadata["native_session_id"]
 
     if agent_type == AgentType.CLAUDE:
-        cmd.extend(["--resume", session_id])
+        # For Claude Code: use native session ID when available, otherwise fallback
+        cmd = list(base_command)
+        cmd.extend(["--resume", effective_session_id])
+        return cmd
     elif agent_type == AgentType.CODEX:
-        cmd.extend(["--resume-from", str(last_seq)])
+        # For Codex: if native session ID exists, use "codex exec resume <thread_id>"
+        # instead of "codex exec --resume-from <seq>"
+        if session_metadata and "native_session_id" in session_metadata:
+            # Replace the entire command with "codex exec resume <thread_id>"
+            native_thread_id = session_metadata["native_session_id"]
+            return ["codex", "exec", "resume", native_thread_id]
+        else:
+            # Fallback to original behavior with base command
+            cmd = list(base_command)
+            cmd.extend(["--resume-from", str(last_seq)])
+            return cmd
     else:
-        cmd.extend(["--resume", session_id, "--from-seq", str(last_seq)])
-
-    return cmd
+        # Generic fallback: use effective session ID with from-seq
+        cmd = list(base_command)
+        cmd.extend(["--resume", effective_session_id, "--from-seq", str(last_seq)])
+        return cmd
 
 
 def build_flow_command(

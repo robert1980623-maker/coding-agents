@@ -77,6 +77,9 @@ class StreamExecutor:
     ) -> AsyncIterator[Event]:
         """Execute command and yield events as they arrive."""
 
+        # Store the session ID so we can access it in _extract_text
+        self._current_session_id = session_id
+
         # Emit session.start event
         start_seq = await self._seq.next()
         start_event = Event(
@@ -196,6 +199,23 @@ class StreamExecutor:
                     data = self._extract_text(text, self.config.output_mode)
                     if data is None:
                         continue
+                    
+                    # Extract native session IDs from agent output (async context)
+                    try:
+                        event_data = json.loads(data)
+                        event_type = event_data.get("type")
+                        # Claude Code: {"type":"system","subtype":"init","session_id":"..."}
+                        if (event_type == "system" and
+                            event_data.get("subtype") == "init" and
+                            "session_id" in event_data):
+                            await self._store_native_session_id(event_data["session_id"])
+                        # Codex: {"type":"thread.started","thread_id":"..."}
+                        elif (event_type == "thread.started" and
+                              "thread_id" in event_data):
+                            await self._store_native_session_id(event_data["thread_id"])
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                    
                     seq = await self._seq.next()
                     event = Event(
                         session_id=session_id,
@@ -419,6 +439,18 @@ class StreamExecutor:
                     last_written_activity = activity
         except asyncio.CancelledError:
             raise
+
+    async def _store_native_session_id(self, native_session_id: str) -> None:
+        """Store native agent session ID in session metadata."""
+        try:
+            session = await self.store.get_session(self._current_session_id)
+            if session is None:
+                return
+            metadata = dict(session.metadata or {})
+            metadata["native_session_id"] = native_session_id
+            await self.store.update_session(self._current_session_id, metadata=metadata)
+        except Exception:
+            pass  # Best-effort; don't break execution if this fails
 
     async def _terminate_process(self) -> None:
         """Gracefully terminate the subprocess: SIGTERM, wait 5s, then SIGKILL.

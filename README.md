@@ -7,6 +7,7 @@ A unified, high-performance runtime for managing coding agents (Claude Code, Cod
 - **Unified Interface**: One API to call Claude Code, Codex, and more agents
 - **Bounded Output**: Dispatch emits only `session_id` + JSON result — safe for the OpenClaw exec 1MB stdout buffer (v0.2.6+)
 - **Session Management**: Track execution sessions with tags, search, and recovery
+- **Native Session Resume**: Captures Claude Code / Codex native session IDs and uses them on `resume` for true conversation continuation (v0.2.29+)
 - **Full-Text Search**: FTS5-powered search across all agent output
 - **Crash Recovery**: Automatic detection and recovery of orphaned sessions
 - **Concurrency Control**: Semaphore-based limit on concurrent agent executions
@@ -71,6 +72,36 @@ coding-agents status <session-id> --no-events
 # Tail (default 100 events, oldest-first within the window)
 coding-agents tail <session-id>
 ```
+
+### Resume a session (v0.2.29+)
+
+Resume continues a session from its native agent state. coding-agents captures
+the agent's native session ID (`init.session_id` for Claude Code,
+`thread.started.thread_id` for Codex) automatically and re-uses it on resume
+instead of inventing a new ID. This makes resumes actually continue the original
+agent conversation.
+
+```bash
+# Resume from the last event
+coding-agents resume <session-id>
+
+# Resume with a follow-up prompt
+coding-agents resume <session-id> "and add tests for the edge cases"
+```
+
+Resume is only available for terminal sessions (`completed`, `killed`, `timeout`)
+with exit code 0. Sessions with non-zero exit code (crashed agents) cannot be
+resumed — their internal state is unreliable.
+
+Behind the scenes:
+- Claude Code: `claude code --resume <native_session_id>`
+- Codex: `codex exec resume <native_thread_id>`
+- Fallback: when no native ID is available (older session, or pre-v0.2.29
+  data), coding-agents falls back to the session's own UUID for Claude, or
+  `--resume-from <seq>` for Codex.
+
+The captured native ID is stored in session metadata as `native_session_id`.
+You can verify it via `coding-agents status <session-id> --no-events`.
 
 ### Garbage-collect old sessions
 

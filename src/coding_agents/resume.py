@@ -109,6 +109,7 @@ def prepare_resume_command(
         session_id=session.id,
         last_seq=last_seq,
         agent_type=agent_type,
+        session_metadata=session.metadata,
     )
 
 
@@ -193,11 +194,17 @@ async def resume_session(
     # Build base command and append resume flags
     config = ExecutionConfig()
     base_command = agent.build_command(resume_info.prompt, config)
+
+    # Get the original session to access its metadata
+    original_session = await storage.get_session(session_id)
+    session_metadata = original_session.metadata if original_session else {}
+
     resume_command = build_resume_command(
         base_command,
         session_id=session_id,
         last_seq=resume_info.last_seq,
         agent_type=agent_type,
+        session_metadata=session_metadata,
     )
 
     # Create new session
