@@ -206,6 +206,10 @@ async def _dispatch_bg_setup(
         console.print(f"[red]Unknown agent type: {agent_name}[/red]")
         raise typer.Exit(code=1)
 
+    # Get agent adapter and its env overrides to apply before spawning subprocess
+    adapter = get_agent(agent_type)
+    overrides = adapter.env_overrides()
+
     storage = _get_storage()
     await storage.initialize()
     try:
@@ -224,6 +228,8 @@ async def _dispatch_bg_setup(
     # so even SIGHUP/SIGTERM to this wrapper doesn't propagate to the agent.
     # Use the `coding-agents` CLI wrapper (not `python -m coding_agents`)
     # because the package has no __main__.py.
+    # Apply agent-specific env overrides to prevent issues like DashScope vars
+    # being inherited by the subprocess.
     runner_argv = [
         "coding-agents", "_bg-runner",
         session.id,
@@ -235,6 +241,19 @@ async def _dispatch_bg_setup(
     if verbose:
         console.print(f"[dim]spawning runner: {' '.join(runner_argv)}[/dim]")
     try:
+        # Start with the current environment
+        env = {**os.environ, "CODING_AGENTS_BG_RUNNER": "1"}
+
+        # Apply agent-specific overrides
+        env.update(overrides)
+
+        # Additionally, specifically for Claude agent, ensure DashScope vars are cleared
+        if agent_type == AgentType.CLAUDE:
+            dashscope_vars = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_MODEL']
+            for var in dashscope_vars:
+                if env.get(var, '').lower().find('dashscope') != -1:
+                    env[var] = ""  # Clear the DashScope variable
+
         proc = subprocess.Popen(
             runner_argv,
             start_new_session=True,
@@ -242,7 +261,7 @@ async def _dispatch_bg_setup(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            env={**os.environ, "CODING_AGENTS_BG_RUNNER": "1"},
+            env=env,
         )
         if verbose:
             console.print(f"[dim]runner PID: {proc.pid}[/dim]")
