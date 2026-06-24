@@ -56,14 +56,6 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
         """Initialize the middleware with an optional custom token path."""
         super().__init__(app)
         self.token_path = token_path
-        # Lazy-loaded token cache. The first request that needs the token
-        # reads the file from disk; every subsequent request uses the
-        # cached value. This eliminates the TOCTOU window where the file
-        # could be rewritten between the middleware's read and a later
-        # read (e.g. from ``verify_token``), which would otherwise cause
-        # spurious 401s on requests that the middleware already approved.
-        self._cached_token: Optional[str] = None
-        self._cache_loaded: bool = False
 
     async def dispatch(
         self, request: Request, call_next: RequestResponseEndpoint
@@ -76,14 +68,7 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
         if request.url.path.rstrip("/") in PUBLIC_PATHS:
             return await call_next(request)
 
-        # Load the stored token from cache (populated lazily on the
-        # first non-public request) and reuse it for both the dev-mode
-        # check and the comparison below.
-        #
-        # The cache is populated once per middleware lifetime, NOT
-        # per-request, so subsequent requests cannot observe a file
-        # change made between the middleware's read and a later read
-        # (e.g. from ``verify_token``). This is the core TOCTOU fix.
+        # Load the stored token from disk on every request.
         #
         # load_token returns:
         #   None  → file does not exist (dev mode: auth disabled).
@@ -91,10 +76,13 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
         #           reject rather than silently disable auth — this is
         #           the security-critical distinction).
         #   str   → valid token to compare against.
-        if not self._cache_loaded:
-            self._cached_token = load_token(self.token_path)
-            self._cache_loaded = True
-        stored = self._cached_token
+        #
+        # We re-read on every request so the server picks up token
+        # regeneration (e.g. CLI re-creating an empty/corrupt file) and
+        # initial token creation (server started before CLI ran once).
+        # The TOCTOU window between this read and verify_token's use of
+        # request.state is negligible (same request lifecycle).
+        stored = load_token(self.token_path)
         if stored is None:
             if not _dev_mode_warned:
                 logger.warning(

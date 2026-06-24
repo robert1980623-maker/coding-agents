@@ -104,45 +104,77 @@ class TestNoTOCTOU:
     async def test_verify_token_uses_middleware_result(
         self, app, monkeypatch, tmp_path
     ):
-        """After middleware validates, verify_token should not re-read the file.
+        """verify_token reads from request.state, not from the file.
 
-        We test this by changing the file content AFTER the middleware read
-        but BEFORE the route handler runs. If verify_token re-reads the file,
-        it would get a different token and return 401.
+        The middleware reads the token file once per request and stores the
+        validated token in ``request.state.auth_token``. verify_token reads
+        from there — it does NOT re-read the file. This eliminates the
+        TOCTOU window where the file could change between the middleware
+        read and the dependency read within the same request.
+
+        We verify this by directly testing verify_token with a mock request
+        that has auth_token set, and confirming it doesn't call load_token
+        even when the file has changed.
+        """
+        from starlette.requests import Request
+        from coding_agents.http.auth import verify_token
+
+        # Create a mock request with auth_token already set by middleware
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/test",
+            "headers": [],
+        }
+        request = Request(scope)
+        request.state.auth_token = "middleware-validated-token"
+
+        # Patch load_token to return a different value. If verify_token
+        # re-reads the file, it would get this patched value and fail.
+        # Instead, it should read from request.state and succeed.
+        import coding_agents.auth as auth_mod
+        original_load = auth_mod.load_token
+
+        def fake_load_token(path=None):
+            return "tampered-token"
+
+        auth_mod.load_token = fake_load_token
+        try:
+            # verify_token should return the value from request.state,
+            # not re-read the file
+            result = await verify_token(request)
+            assert result == "middleware-validated-token"
+        finally:
+            auth_mod.load_token = original_load
+
+    async def test_token_file_change_picked_up_on_next_request(
+        self, app, monkeypatch, tmp_path
+    ):
+        """When the token file is regenerated, subsequent requests use the
+        new token. The middleware re-reads the file on every request so it
+        picks up token changes (e.g. CLI regenerating a corrupt file).
         """
         token_path = tmp_path / "token"
         original_token = ensure_token(str(token_path))
         monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(token_path))
 
-        # Track load_token calls in the route handler
-        load_count = {"count": 0}
-        original_load_token = __import__(
-            "coding_agents.http.auth", fromlist=["load_token"]
-        ).load_token if False else None  # noqa
-
         async with _client(app, {"Authorization": f"Bearer {original_token}"}) as client:
-            # Warmup: the middleware reads the token file on this first
-            # non-public request and caches the result for the lifetime
-            # of the middleware. This is the load that would have happened
-            # in a real TOCTOU race (middleware read, then file change,
-            # then handler read).
-            warmup = await client.get("/sessions")
-            assert warmup.status_code == 200, (
-                f"warmup request failed with {warmup.status_code}: {warmup.text}"
-            )
+            # First request with original token succeeds
+            response1 = await client.get("/sessions")
+            assert response1.status_code == 200
 
-            # Now change the file. The middleware's cache still holds the
-            # original token, so the next request's Bearer check will use
-            # the cached value (not the new file content) and succeed.
-            # verify_token reads from request.state.auth_token (set by the
-            # middleware from the cache), not from the file, so the file
-            # change is invisible to it.
-            token_path.write_text("different-token\n")
-            response = await client.get("/sessions")
+            # Regenerate the token file with a new value
+            new_token = "newly-generated-token-value"
+            token_path.write_text(new_token + "\n")
 
-        # Should still succeed because middleware already validated and
-        # stored the result in request.state.
-        assert response.status_code == 200
+            # Old token now fails
+            response2 = await client.get("/sessions")
+            assert response2.status_code == 401
+
+        # New token succeeds
+        async with _client(app, {"Authorization": f"Bearer {new_token}"}) as client:
+            response3 = await client.get("/sessions")
+            assert response3.status_code == 200
 
 
 class TestTokenRequired:
