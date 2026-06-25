@@ -3,7 +3,7 @@ name: coding-agents-lifecycle
 description: |
   How to inspect, monitor, and garbage-collect coding-agents sessions.
   Use when you need to check session progress, debug failures, or
-  reclaim disk space. Covers `tail`, `status`, and `gc` subcommands.
+  reclaim disk space. Covers `tail`, `status`, `gc`, `poll`, and `watch` subcommands.
 ---
 
 # coding-agents-lifecycle
@@ -14,6 +14,14 @@ Manage the lifecycle of coding-agents sessions stored in SQLite.
 > It only prints `session_id=<id>` early and one JSON result line at the end.
 > Intermediate stdout/stderr events live in SQLite. Use `tail` / `status`
 > to read them.
+
+> **v0.2.29+ idle timeout**: Sessions can be killed automatically after a period
+> of inactivity using `--idle-timeout N` (default: 300s). This prevents sessions
+> from running indefinitely.
+
+> **v0.2.32+ auto-cleanup**: `status` and `poll` automatically detect stuck
+> sessions (pending > 2min → failed, running > 24h no heartbeat → orphaned).
+> Disable with `--no-auto-clean` if needed.
 
 ## When to use this skill
 
@@ -77,6 +85,26 @@ while true; do coding-agents status <id>; sleep 60; done
 
 If a session genuinely needs shorter polling, the task is too long —
 split it (see `coding-agents-dispatch` skill).
+
+### `coding-agents poll` (v0.2.31+)
+
+Show a one-line status overview for all active sessions:
+
+```bash
+coding-agents poll                              # running/pending sessions with auto-cleanup
+coding-agents poll --all                        # include completed/failed
+coding-agents poll --status running             # filter by status
+coding-agents poll --stuck-after 1h             # custom stuck threshold
+coding-agents poll --format json                # machine-readable output
+coding-agents poll --no-auto-clean --quiet      # suppress cleanup report
+```
+
+**Auto-cleanup (v0.2.32+)**: By default, `poll` automatically cleans stuck
+sessions before showing results:
+- `pending` sessions with no heartbeat > 2min → marked `failed`
+- `running` sessions with no heartbeat > 24h → marked `orphaned`
+
+Disable with `--no-auto-clean` if you want to inspect stuck sessions.
 
 ### `coding-agents gc`
 

@@ -6,6 +6,7 @@ description: |
   via the coding-agents runtime, with the right working directory
   and cost controls. v0.2.6+: dispatch output is bounded — use
   `tail` / `status` to read intermediate events.
+  v0.2.17+: use `dispatch-bg` for OpenClaw/exec wrappers (fire-and-forget).
 ---
 
 # Coding Agents — Dispatch
@@ -17,6 +18,22 @@ description: |
   project's `AGENTS.md` / `CLAUDE.md` / `.claude/skills/`)
 - You want cost control (budget) or resumable sessions via SQLite
 - You need OpenClaw-safe output (no 1MB buffer overflow)
+- You want idle timeout protection (v0.2.29+)
+
+## dispatch vs dispatch-bg
+
+| Scenario | Use |
+| --- | --- |
+| Human runs from terminal | `dispatch` (blocking, result inline) |
+| Agent / cron / orchestrator calls | **`dispatch-bg`** (fire-and-forget, <1s reply) |
+| Task < 30s and need result NOW | `dispatch` (with short prompt) |
+
+**Use `dispatch-bg` when calling from inside OpenClaw/exec wrappers**.
+OpenClaw's `exec` tool has a 30s timeout. `dispatch-bg` returns the
+`session_id` within ~1 second, then the agent runs in a detached subprocess.
+The wrapper exits immediately; query `status <id>` to inspect progress.
+
+See `coding-agents dispatch-bg --help` for all available flags.
 
 ## Default: dispatch without model or budget
 
@@ -324,6 +341,9 @@ from inside a 30s exec call.
 # Returns within ~1s with session_id
 coding-agents dispatch-bg claude "<prompt>" --workdir /path/to/project
 
+# With idle timeout (default: 300s, v0.2.29+)
+coding-agents dispatch-bg claude "<prompt>" --workdir /path/to/project --idle-timeout 900
+
 # Output (always 2 lines, < 1KB):
 session_id=<uuid>
 {"session_id": "...", "status": "running"}
@@ -332,6 +352,10 @@ session_id=<uuid>
 coding-agents status <id>
 coding-agents tail <id> --limit 20
 ```
+
+> **Idle timeout** (v0.2.29+): Use `--idle-timeout N` to kill sessions that
+> haven't produced output for N seconds. This prevents silent hangs. Default
+> is 300 seconds (5 minutes).
 
 ### Why both commands still exist
 

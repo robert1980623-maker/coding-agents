@@ -24,7 +24,7 @@ trigger conditions match the task you were given.
 |---|---|---|
 | `coding-agents-dispatch` | How to correctly dispatch a coding-agents session for a project task (workdir, prompt, isolation, handoff). | `.coding-agents/skills/coding-agents-dispatch/SKILL.md` |
 | `coding-agents-lifecycle` | How to inspect, monitor, and garbage-collect coding-agents sessions (status, logs, GC). | `.coding-agents/skills/coding-agents-lifecycle/SKILL.md` |
-| `coding-agents-recovery` | How to detect, diagnose, and recover from crashed or orphaned sessions. | `.coding-agents/skills/coding-agents-recovery/SKILL.md` |
+| `coding-agents-recovery` | How to detect, diagnose, and recover from crashed or orphaned sessions. Auto-cleanup (v0.2.32+) handles stuck sessions automatically via `status` and `poll`. Use `recover` for a full database scan. | `.coding-agents/skills/coding-agents-recovery/SKILL.md` |
 | `coding-agents-cost` | How to estimate, monitor, and cap the cost/token budget of a coding-agents session. | `.coding-agents/skills/coding-agents-cost/SKILL.md` |
 | `coding-agents-skills` | How to manage project-local and global skill directories used by coding-agents. | `.coding-agents/skills/coding-agents-skills/SKILL.md` |
 

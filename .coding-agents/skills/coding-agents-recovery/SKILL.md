@@ -5,6 +5,10 @@ description: |
   coding-agents sessions. Use this skill when a session is stuck in
   "running" status, a previous run died mid-task, or you need to
   figure out what happened to a session that never completed.
+
+  Note: Auto-cleanup (v0.2.32+) handles stuck sessions automatically
+  via `status` and `poll`. Use this skill for a full database scan
+  or when auto-cleanup has been disabled.
 ---
 
 # Coding Agents — Recovery

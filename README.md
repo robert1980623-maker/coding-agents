@@ -9,14 +9,19 @@ A unified, high-performance runtime for managing coding agents (Claude Code, Cod
 - **Session Management**: Track execution sessions with tags, search, and recovery
 - **Native Session Resume**: Captures Claude Code / Codex native session IDs and uses them on `resume` for true conversation continuation (v0.2.29+)
 - **Full-Text Search**: FTS5-powered search across all agent output
-- **Crash Recovery**: Automatic detection and recovery of orphaned sessions
+- **Auto-cleanup**: Automatic detection and cleanup of stuck sessions (pending > 2min → failed, running > 24h no heartbeat → orphaned) (v0.2.32+)
+- **Fire-and-forget Mode**: `dispatch-bg` returns session_id in <1s for use with OpenClaw/exec wrappers (v0.2.17+)
+- **Fleet Health Monitoring**: `poll` command shows one-line status overview for all active sessions (v0.2.31+)
 - **Concurrency Control**: Semaphore-based limit on concurrent agent executions
 - **Garbage Collection**: `gc` cleans up old sessions to bound SQLite size (v0.2.6+)
+- **Idle Timeout Protection**: `--idle-timeout` flag prevents sessions from running indefinitely (v0.2.29+)
+- **Ghost Session Prevention**: Auto-cleanup and health checks for pending/running sessions (v0.2.32+)
 - **HTTP API**: REST endpoints + SSE event streaming
 - **Python SDK**: Async-only client for OpenClaw / Hermes / any async Python host
 - **OpenClaw Integration**: Example scripts + integration guide
 - **Project-local skills**: SKILL.md catalog under `.coding-agents/skills/`
   (agentskill.io standard) discoverable by Claude Code / Codex natively
+- **Version Flag**: `--version` / `-v` shows coding-agents X.Y.Z (v0.2.33+)
 
 ## Installation
 
@@ -32,7 +37,19 @@ uv sync
 
 ### Dispatch an agent
 
-`dispatch` is the canonical command. Output is bounded — safe for
+**For OpenClaw/exec wrappers, use `dispatch-bg`** — it returns in ~1 second
+instead of waiting for the agent to complete (which may exceed the 30s
+wrapper timeout).
+
+```bash
+# Recommended for wrappers (returns instantly with session_id)
+coding-agents dispatch-bg claude "fix the race condition" --workdir ~/projects/foo
+
+# Or use dispatch for blocking execution from a terminal
+coding-agents dispatch claude "fix the race condition" --workdir ~/projects/foo
+```
+
+The canonical command is `dispatch`. Output is bounded — safe for
 OpenClaw exec, where stdout/stderr is capped at 1MB.
 
 ```bash
@@ -50,6 +67,9 @@ coding-agents dispatch claude "optimize this" --model claude-sonnet-4-20250514
 
 # Budget cap (claude only — codex ignores it with a warning, v0.2.9+)
 coding-agents dispatch claude "rewrite module" --budget 5.0
+
+# Idle timeout (prevents sessions from running forever, v0.2.29+)
+coding-agents dispatch claude "analyze large codebase" --idle-timeout 900
 ```
 
 > v0.2.6+: dispatch never streams intermediate output. It prints
@@ -72,6 +92,13 @@ coding-agents status <session-id> --no-events
 # Tail (default 100 events, oldest-first within the window)
 coding-agents tail <session-id>
 ```
+
+> v0.2.29+: `--idle-timeout` (default: 300s) kills sessions with no output
+> for the configured duration. Use longer timeouts for long-running analysis.
+
+> v0.2.32+: `status` and `poll` automatically clean stuck sessions by default
+> (pending > 2min → failed, running > 24h no heartbeat → orphaned). Disable
+> with `--no-auto-clean` if needed.
 
 ### Resume a session (v0.2.29+)
 
@@ -116,6 +143,16 @@ coding-agents gc --dry-run
 coding-agents gc --keep-result-only
 ```
 
+### Auto-cleanup vs garbage collection
+
+- **Auto-cleanup** (v0.2.32+, `poll` and `status`): Immediate cleanup of stuck
+  sessions that are blocking the system (pending > 2min, running > 24h no heartbeat)
+- **Garbage collection** (`gc`): Cleanup of old completed/failed sessions to
+  reclaim disk space (default: 30 days for completed, 7 days for failed)
+
+Run `gc` periodically (e.g., weekly). Auto-cleanup runs automatically on
+session inspection commands.
+
 ### List / filter / kill
 
 ```bash
@@ -147,6 +184,94 @@ coding-agents search "refactor"
 ```bash
 # Scan for orphaned sessions (heartbeat timeout)
 coding-agents recover
+```
+
+> **Note**: `status` and `poll` automatically detect and clean stuck sessions
+> by default. Use `coding-agents recover` for a full scanned fix-up of the
+> entire database, or when `--auto-clean` has been disabled.
+
+### Auto-cleanup (v0.2.32+)
+
+`poll` and `status` automatically clean stuck sessions by default:
+
+- **Pending sessions > 2min** are marked as `failed`
+- **Running sessions with no heartbeat > 24h** are marked as `orphaned`
+
+This prevents ghost sessions from clogging the system. You can disable
+auto-cleanup with `--no-auto-clean`:
+
+```bash
+coding-agents poll --no-auto-clean      # see stuck sessions without cleanup
+coding-agents status <id> --no-auto-clean
+```
+
+### Dispatch in fire-and-forget mode (v0.2.17+)
+
+Use `dispatch-bg` when calling from inside OpenClaw/exec wrappers or orchestrators
+with a 30s timeout limit. Unlike `dispatch`, it returns the `session_id` within
+~1 second and the actual agent runs in a detached subprocess.
+
+```bash
+# Returns instantly with session_id
+coding-agents dispatch-bg claude "refactor the auth module" --workdir ~/projects/foo
+
+# Output (always < 1KB):
+session_id=abc-123-def
+{"session_id": "...", "status": "running"}
+
+# Then poll progress later
+coding-agents status <session-id>
+```
+
+**When to use which:**
+
+| Scenario | Use |
+| --- | --- |
+| Human runs from terminal | `dispatch` (blocking, result inline) |
+| Agent / cron / orchestrator calls | **`dispatch-bg`** (fire-and-forget) |
+| Task < 30s and need result NOW | `dispatch` (with short prompt) |
+
+### Fleet health monitoring (v0.2.31+)
+
+Use `poll` to get a one-line status overview for all active sessions:
+
+```bash
+# Default: show running/pending sessions with auto-cleanup
+coding-agents poll
+
+# Include all sessions (completed, failed too)
+coding-agents poll --all
+
+# Filter by status
+coding-agents poll --status running
+
+# Custom stuck threshold (30m default)
+coding-agents poll --stuck-after 1h
+
+# Suppress cleanup summary report
+coding-agents poll --quiet
+
+# JSON output for programmatic use
+coding-agents poll --format json
+```
+
+Example output:
+
+```
+SESSION ID                           STATUS  AGE      LAST EVENT
+abc-123...                           running  5m 32s   stdout (12 events)
+def-456...                           pending  1m 15s   started
+xyz-789...                           running  24h 3m   heartbeat STUCK (no event in 24h)
+```
+
+### Version flag (v0.2.33+)
+
+```bash
+coding-agents --version
+# coding-agents 0.2.33
+
+coding-agents -v
+# coding-agents 0.2.33
 ```
 
 ### HTTP API
@@ -212,7 +337,7 @@ root (see `AGENTS.md` and `.claude/skills/` symlinks at the project root).
 | --- | --- |
 | `coding-agents-dispatch` | You need to dispatch a coding-agents session for a project task |
 | `coding-agents-lifecycle` | You need to inspect a session, read its events, or clean up old data |
-| `coding-agents-recovery` | A session is stuck / orphaned; you need to recover |
+| `coding-agents-recovery` | A session is stuck / orphaned; you need to recover (auto-cleanup handles most cases in v0.2.32+) |
 | `coding-agents-cost` | You need to budget, monitor, or cap session cost |
 | `coding-agents-skills` | You need to install, update, or share a skill |
 
@@ -238,6 +363,16 @@ CLI → SessionRegistry (concurrency control) → StreamExecutor → Agent Adapt
 - **StreamExecutor**: Async subprocess management with bounded CLI output (v0.2.6+)
 - **StorageBackend**: Protocol-based storage with SQLite implementation
 - **Agent Adapters**: Claude Code (supports `--max-budget-usd`) and Codex CLI (no budget flag)
+
+### Auto-cleanup (v0.2.32+)
+
+When you query a session via `status` or `poll`, the runtime checks:
+- If a `pending` session has no heartbeat for > 2 minutes → marks it `failed`
+- If a `running` session has no events for > 24 hours → marks it `orphaned`
+
+This prevents ghost sessions from blocking the queue without manual intervention.
+To disable (for debugging), use `--no-auto-clean`. Run `gc` regularly to remove
+completed/failed sessions older than the retention period (30/7 days).
 
 ## Development
 
