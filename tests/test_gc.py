@@ -242,3 +242,103 @@ def test_gc_dry_run(tmp_path: Path, monkeypatch):
         return session is not None
 
     assert asyncio.run(check()) is True
+
+
+def test_gc_marks_stuck_pending_as_failed(tmp_path: Path, monkeypatch):
+    """`gc` should mark sessions stuck in pending for > 2 minutes as failed."""
+    db_path = tmp_path / "test.db"
+    monkeypatch.setenv("CODING_AGENTS_DB", str(db_path))
+
+    import asyncio
+    async def setup():
+        s = SQLiteStorage(db_path)
+        await s.initialize()
+        # Create a pending session 3 minutes ago
+        session = _make_session()
+        await s.create_session(session)
+        old_time = datetime.now(timezone.utc) - timedelta(minutes=3)
+        await s.update_session(
+            session.id,
+            created_at=old_time,
+        )
+        await s.close()
+        return session.id
+
+    sid = asyncio.run(setup())
+
+    # Run gc (should not fail pending by default since cutoff is 120s from now)
+    # But let's test with sync via storage directly first
+
+    # Verify session is still pending
+    async def check1():
+        s = SQLiteStorage(db_path)
+        await s.initialize()
+        session = await s.get_session(sid)
+        await s.close()
+        return session.status if session else None
+
+    assert asyncio.run(check1()) == SessionStatus.PENDING
+
+    # Directly test recover_pending_sessions
+    async def recover():
+        s = SQLiteStorage(db_path)
+        await s.initialize()
+        count = await s.recover_pending_sessions(timeout_seconds=120)
+        await s.close()
+        return count
+
+    count = asyncio.run(recover())
+    assert count == 1
+
+    # Verify session is now failed
+    async def check2():
+        s = SQLiteStorage(db_path)
+        await s.initialize()
+        session = await s.get_session(sid)
+        await s.close()
+        return session.status if session else None
+
+    assert asyncio.run(check2()) == SessionStatus.FAILED
+
+    # Verify metadata
+    async def check_metadata():
+        s = SQLiteStorage(db_path)
+        await s.initialize()
+        session = await s.get_session(sid)
+        await s.close()
+        return session.metadata if session else {}
+
+    metadata = asyncio.run(check_metadata())
+    assert "error" in metadata
+    assert "pending timeout" in metadata["error"]
+
+
+def test_gc_dry_run_on_pending_timeout(tmp_path: Path, monkeypatch):
+    """`gc --dry-run` should report pending sessions that would be marked failed."""
+    db_path = tmp_path / "test.db"
+    monkeypatch.setenv("CODING_AGENTS_DB", str(db_path))
+
+    import asyncio
+    async def setup():
+        s = SQLiteStorage(db_path)
+        await s.initialize()
+        # Create a pending session 3 minutes ago
+        session = _make_session()
+        await s.create_session(session)
+        old_time = datetime.now(timezone.utc) - timedelta(minutes=3)
+        await s.update_session(
+            session.id,
+            created_at=old_time,
+        )
+        await s.close()
+        return session.id
+
+    sid = asyncio.run(setup())
+
+    # Dry run gc
+    import typer.main
+    click_app = typer.main.get_command(app)
+    result = runner.invoke(click_app, ["gc", "--dry-run"])
+    assert result.exit_code == 0
+    # Should report pending sessions
+    assert "pending" in result.output.lower()

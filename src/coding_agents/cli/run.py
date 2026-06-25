@@ -282,6 +282,34 @@ async def _dispatch_bg_setup(
         )
         if verbose:
             console.print(f"[dim]runner PID: {proc.pid}[/dim]")
+
+        # Post-spawn health check: wait briefly then verify runner is still alive.
+        # If the runner crashes immediately (e.g. auth failure, 401/429), we detect
+        # it here rather than leaving the session in 'pending' forever.
+        import asyncio as _asyncio
+        await _asyncio.sleep(3)  # Wait for runner to start
+        if proc.poll() is not None:
+            # Runner exited; capture exit code and mark session failed
+            exit_code = proc.poll()
+            storage = _get_storage()
+            await storage.initialize()
+            try:
+                await storage.update_session(
+                    session.id,
+                    status=SessionStatus.FAILED,
+                    finished_at=datetime.now(timezone.utc),
+                    exit_code=exit_code,
+                    metadata={"error": f"bg-runner crashed immediately after spawn (exit code: {exit_code})"},
+                )
+            finally:
+                await storage.close()
+            console.print(json.dumps({
+                "session_id": session.id,
+                "status": "spawn_failed",
+                "exit_code": exit_code,
+                "error": f"bg-runner crashed immediately after spawn (exit code: {exit_code})",
+            }))
+            raise typer.Exit(code=1)
     except Exception as e:
         # Spawn failed; mark session failed before exiting.
         storage = _get_storage()

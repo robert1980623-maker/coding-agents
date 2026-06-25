@@ -412,6 +412,118 @@ class TestCorruptTokenFile:
         )
 
 
+class TestTokenFileDeletionAfterAuthActive:
+    """If the token file is deleted after the server has loaded a valid token,
+    the middleware must NOT fall through to dev-mode bypass — that would
+    silently disable auth (security bug).
+
+    Instead, requests must be rejected with 500. Dev mode is only valid
+    when the token file has NEVER been seen — once auth has been active,
+    a missing file is a broken-auth condition.
+    """
+
+    async def test_deleted_token_file_rejects_not_dev_mode(
+        self, app, monkeypatch, tmp_path
+    ):
+        """After a valid token is loaded, deleting the file → 500, NOT 200.
+
+        Without this fix, deleting the token file would cause load_token to
+        return None, which the middleware would treat as dev mode — silently
+        disabling auth and allowing all requests through.
+        """
+        token_path = tmp_path / "token"
+        token = ensure_token(str(token_path))
+        monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(token_path))
+
+        # First request with valid token succeeds (and marks auth as active)
+        async with _client(app, {"Authorization": f"Bearer {token}"}) as client:
+            response = await client.get("/sessions")
+        assert response.status_code == 200
+
+        # Now delete the token file — simulates an attacker or accidental deletion
+        token_path.unlink()
+        assert not token_path.exists()
+
+        # Without a valid token: should be 500 (broken auth), NOT 200 (dev mode)
+        async with _client(app) as client:
+            response = await client.get("/sessions")
+        # Must NOT be 200 — that would mean auth was silently bypassed
+        assert response.status_code == 500, (
+            "Deleted token file after auth was active must return 500, "
+            f"not {response.status_code} (which would mean dev-mode bypass)"
+        )
+        assert "missing" in response.json()["detail"].lower()
+
+    async def test_deleted_token_file_still_allows_health(
+        self, app, monkeypatch, tmp_path
+    ):
+        """/health is fully public — works even after token file is deleted."""
+        token_path = tmp_path / "token"
+        token = ensure_token(str(token_path))
+        monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(token_path))
+
+        # Activate auth with a valid request
+        async with _client(app, {"Authorization": f"Bearer {token}"}) as client:
+            await client.get("/sessions")
+
+        # Delete the file
+        token_path.unlink()
+
+        # /health still works
+        async with _client(app) as client:
+            response = await client.get("/health")
+        assert response.status_code == 200
+
+    async def test_token_file_recreated_after_deletion_works(
+        self, app, monkeypatch, tmp_path
+    ):
+        """After deletion + 500, recreating the file restores auth."""
+        token_path = tmp_path / "token"
+        token = ensure_token(str(token_path))
+        monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(token_path))
+
+        # Activate auth
+        async with _client(app, {"Authorization": f"Bearer {token}"}) as client:
+            response = await client.get("/sessions")
+        assert response.status_code == 200
+
+        # Delete → 500
+        token_path.unlink()
+        async with _client(app) as client:
+            response = await client.get("/sessions")
+        assert response.status_code == 500
+
+        # Recreate the file with a new token → auth works again
+        new_token = "newly-regenerated-token"
+        token_path.write_text(new_token + "\n")
+        async with _client(app, {"Authorization": f"Bearer {new_token}"}) as client:
+            response = await client.get("/sessions")
+        assert response.status_code == 200
+
+    async def test_deleted_token_file_logs_error(
+        self, app, monkeypatch, tmp_path, caplog
+    ):
+        """Deleting the token file after auth was active logs an error."""
+        token_path = tmp_path / "token"
+        token = ensure_token(str(token_path))
+        monkeypatch.setattr("coding_agents.auth.DEFAULT_TOKEN_PATH", str(token_path))
+
+        # Activate auth
+        async with _client(app, {"Authorization": f"Bearer {token}"}) as client:
+            await client.get("/sessions")
+
+        # Delete the file → should log error
+        token_path.unlink()
+        with caplog.at_level(logging.ERROR, logger="coding_agents.http.middleware"):
+            async with _client(app) as client:
+                await client.get("/sessions")
+
+        assert any(
+            "auth_broken_token_file_missing" in r.getMessage()
+            for r in caplog.records
+        )
+
+
 class TestAllEndpointsProtected:
     """Spot-check that every route category goes through auth."""
 

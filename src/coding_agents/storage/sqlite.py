@@ -579,6 +579,37 @@ class SQLiteStorage:
             await asyncio.to_thread(conn.commit)
             return cursor.rowcount
 
+    async def recover_pending_sessions(self, timeout_seconds: int = 120) -> int:
+        """Mark sessions stuck in 'pending' status as 'failed'.
+
+        Sessions stuck in pending for too long (default 120s) likely had
+        their runner subprocess crash immediately (e.g. auth failure, 401/429).
+
+        Args:
+            timeout_seconds: Minutes a session can stay in pending before being marked failed.
+
+        Returns:
+            Number of sessions marked as failed.
+        """
+        conn = await self._get_conn()
+        now_ts = datetime.now(timezone.utc).timestamp()
+        cutoff = now_ts - timeout_seconds
+        async with self._lock:
+            cursor = await asyncio.to_thread(
+                conn.execute,
+                """
+                UPDATE sessions
+                SET status = 'failed', exit_code = -1,
+                    finished_at = ?, updated_at = ?,
+                    metadata = ?
+                WHERE status = 'pending'
+                  AND created_at < ?
+                """,
+                (now_ts, now_ts, '{"error": "pending timeout: runner likely crashed before starting"}', cutoff),
+            )
+            await asyncio.to_thread(conn.commit)
+            return cursor.rowcount
+
     async def delete_session(self, session_id: str) -> None:
         """Delete a session and all its events (and tags)."""
         conn = await self._get_conn()

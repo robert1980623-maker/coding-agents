@@ -63,6 +63,64 @@ RETRYABLE_STATUS_CODES = {429, 503, 504}
 DEFAULT_TOKEN_PATH = "~/.coding-agents-token"
 
 
+class _StaticBearerAuth(httpx.Auth):
+    """Static Bearer-token auth for explicit tokens.
+
+    Used when the caller provides an explicit ``token=`` argument or
+    ``CODING_AGENTS_TOKEN`` env var. The token is fixed at construction
+    time — no file I/O is performed on each request.
+    """
+
+    def __init__(self, token: str) -> None:
+        self._token = token
+
+    def auth_flow(self, request: httpx.Request):  # type: ignore[override]
+        request.headers["Authorization"] = f"Bearer {self._token}"
+        yield request
+
+
+class _DynamicBearerAuth(httpx.Auth):
+    """Dynamic Bearer-token auth that re-reads the token on each request.
+
+    This fixes the stale-token bug: when the server's token file is
+    regenerated (e.g. CLI re-creates a corrupt file), a long-lived SDK
+    client must pick up the new token instead of sending the old one.
+
+    Resolution order (mirrors ``_load_token_from_file``):
+    1. ``CODING_AGENTS_TOKEN`` environment variable.
+    2. Token file at ``token_path`` (explicit or default).
+
+    Returns ``None`` if no token is available, which causes httpx to send
+    no Authorization header (server accepts in dev mode or rejects with 401).
+    """
+
+    def __init__(self, token_path: str | None = None) -> None:
+        self._token_path = token_path
+
+    def _resolve_token(self) -> str | None:
+        """Read the token from env var or file — called on every request."""
+        env_token = os.environ.get("CODING_AGENTS_TOKEN")
+        if env_token:
+            return env_token
+        raw = self._token_path or os.environ.get(
+            "CODING_AGENTS_TOKEN_PATH"
+        ) or DEFAULT_TOKEN_PATH
+        path = Path(raw).expanduser().resolve()
+        if not path.is_file():
+            return None
+        try:
+            content = path.read_text().strip()
+        except OSError:
+            return None
+        return content or None
+
+    def auth_flow(self, request: httpx.Request):  # type: ignore[override]
+        token = self._resolve_token()
+        if token:
+            request.headers["Authorization"] = f"Bearer {token}"
+        yield request
+
+
 def _load_token_from_file(token_path: str | None = None) -> str | None:
     """Read the auth token from the on-disk token file.
 
@@ -80,15 +138,29 @@ def _load_token_from_file(token_path: str | None = None) -> str | None:
         the SDK surfaces the failure as a 401 at request time rather than
         silently sending a broken header.
     """
+    token, _ = _load_token_with_path(token_path)
+    return token
+
+
+def _load_token_with_path(
+    token_path: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Like ``_load_token_from_file`` but also returns the resolved path.
+
+    Returns:
+        Tuple of ``(token, resolved_path)``. ``token`` is ``None`` when the
+        file does not exist or is empty. ``resolved_path`` is the absolute
+        path that was checked (useful for ``_DynamicBearerAuth``).
+    """
     raw = token_path or os.environ.get("CODING_AGENTS_TOKEN_PATH") or DEFAULT_TOKEN_PATH
     path = Path(raw).expanduser().resolve()
     if not path.is_file():
-        return None
+        return None, str(path)
     try:
         content = path.read_text().strip()
     except OSError:
-        return None
-    return content or None
+        return None, str(path)
+    return content or None, str(path)
 
 
 class CancelToken:
@@ -199,27 +271,62 @@ class AsyncCodingAgentClient:
         #    server validates. This lets the SDK work out-of-the-box when
         #    the user has already run the CLI once, without requiring them
         #    to manually copy the token into an env var.
+        #
+        # BUG-FIX NOTE: when the token comes from file/env, we use
+        # ``_DynamicBearerAuth`` which re-reads the token on each request.
+        # This ensures that if the server regenerates the token (e.g. CLI
+        # re-creates a corrupt file), a long-lived SDK client picks up the
+        # new token instead of sending the stale one cached at construction.
+        auth_token_path: str | None = None
+        auth: httpx.Auth | None = None
+        token_source = "explicit"  # "explicit" | "env" | "file"
         if token is None:
             env_token = os.environ.get("CODING_AGENTS_TOKEN")
             if env_token:
                 token = env_token
+                token_source = "env"
             else:
                 # Env var not set (or set to "") — try the token file.
                 # An empty env var means "no auth", so we only read the
                 # file when the var is truly unset (None).
                 if env_token is None:
-                    token = _load_token_from_file(token_path)
+                    token, auth_token_path = _load_token_with_path(token_path)
+                    if token:
+                        token_source = "file"
                 # else: env_token == "" → leave token as None (no auth).
         if client is None:
             merged_headers: dict[str, str] = dict(headers or {})
             if token:
+                # Static Authorization header — kept for backward compat
+                # (callers inspecting ``client._client.headers``). The
+                # per-request ``auth`` below overrides this on each actual
+                # request with the current token (see BUG-FIX NOTE above).
                 merged_headers["Authorization"] = f"Bearer {token}"
+            # Choose auth strategy:
+            # - Explicit ``token=`` → static auth (caller controls lifetime).
+            # - Token from file or env var → dynamic auth (re-read on each
+            #   request so the client picks up server-side regeneration or
+            #   env var changes without re-constructing the client).
+            # - No token → no auth (dev mode or no auth at all).
+            if token and token_source == "file":
+                # Token came from file — use dynamic auth.
+                auth = _DynamicBearerAuth(token_path=auth_token_path)
+            elif token and token_source == "env":
+                # Token came from env var — use dynamic auth (env var
+                # can change at runtime too).
+                auth = _DynamicBearerAuth(token_path=None)
+            elif token:
+                # Explicit token= — use static auth.
+                auth = _StaticBearerAuth(token)
+            # else: no token → auth=None, no Authorization header sent.
             client_kwargs: dict[str, Any] = {
                 "base_url": base_url.rstrip("/"),
                 "timeout": timeout,
             }
             if merged_headers:
                 client_kwargs["headers"] = merged_headers
+            if auth is not None:
+                client_kwargs["auth"] = auth
             if transport is not None:
                 client_kwargs["transport"] = transport
             self._client = httpx.AsyncClient(**client_kwargs)
@@ -230,6 +337,7 @@ class AsyncCodingAgentClient:
 
         self._base_url = base_url.rstrip("/")
         self._token = token
+        self._auth_token_path = auth_token_path
         self._max_retries = max_retries
         self._retry_base_delay = retry_base_delay
         self._retry_max_delay = retry_max_delay

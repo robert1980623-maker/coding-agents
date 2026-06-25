@@ -141,3 +141,79 @@ class TestExecutionConfigIdleTimeout:
         # Modify and verify
         config.idle_timeout_seconds = 600
         assert config.idle_timeout_seconds == 600
+
+
+class TestDispatchBgPostSpawnHealthCheck:
+    """Test the post-spawn health check in _dispatch_bg_setup."""
+
+    def test_health_check_detects_crashed_runner(self, mock_db: Path):
+        """Health check should detect if runner crashes immediately after spawn."""
+        import time
+        from unittest.mock import patch, MagicMock
+
+        # Create a runner that will exit immediately
+        # We'll patch subprocess.Popen to return a process that's already dead
+        dead_process = MagicMock()
+        dead_process.pid = 12345
+        dead_process.poll.return_value = 1  # Already exited with code 1
+
+        with patch("coding_agents.cli.run.subprocess.Popen", return_value=dead_process):
+            with patch("coding_agents.cli.get_agent") as mock_get_agent:
+                # Mock agent adapter
+                class FakeAdapter:
+                    def build_command(self, prompt, config):
+                        return ["echo", "test"]
+
+                    def env_overrides(self):
+                        return {}
+
+                    def env_deletions(self):
+                        return {}
+
+                mock_get_agent.return_value = FakeAdapter()
+
+                result = runner.invoke(
+                    app,
+                    ["dispatch-bg", "claude", "test prompt"],
+                    catch_exceptions=False,
+                )
+
+                # Should output spawn_failed status
+                assert result.exit_code == 1
+                assert "spawn_failed" in result.output
+
+    def test_health_check_allows_running_runner(self, mock_db: Path):
+        """Health check should allow runners that are still alive."""
+        from unittest.mock import patch, MagicMock
+
+        # Create a runner that is still alive
+        running_process = MagicMock()
+        running_process.pid = 67890
+        running_process.poll.return_value = None  # Process still running
+
+        with patch("coding_agents.cli.run.subprocess.Popen", return_value=running_process):
+            with patch("coding_agents.cli.get_agent") as mock_get_agent:
+                # Mock agent adapter
+                class FakeAdapter:
+                    def build_command(self, prompt, config):
+                        return ["echo", "test"]
+
+                    def env_overrides(self):
+                        return {}
+
+                    def env_deletions(self):
+                        return {}
+
+                mock_get_agent.return_value = FakeAdapter()
+
+                # We need to also mock asyncio.sleep to skip the 3s wait
+                with patch("asyncio.sleep", return_value=None):
+                    result = runner.invoke(
+                        app,
+                        ["dispatch-bg", "claude", "test prompt"],
+                        catch_exceptions=False,
+                    )
+
+                    # Should succeed (runner is still running)
+                    assert result.exit_code == 0
+                    assert "session_id=" in result.output

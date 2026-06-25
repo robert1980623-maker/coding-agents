@@ -141,10 +141,12 @@ async def _gc_sessions(
         completed_cutoff = now - timedelta(days=older_than_days)
         failed_cutoff = now - timedelta(days=failed_after_days)
         orphan_cutoff = now - timedelta(hours=24)
+        pending_cutoff = now - timedelta(seconds=120)  # 2 minutes
 
         to_drop_sids: list[str] = []
         to_prune_sids: list[str] = []
         to_orphan_sids: list[str] = []
+        to_fail_pending_sids: list[str] = []
         for s in sessions:
             if s.status in (SessionStatus.COMPLETED, SessionStatus.KILLED, SessionStatus.TIMEOUT):
                 if s.finished_at and s.finished_at < completed_cutoff:
@@ -156,6 +158,10 @@ async def _gc_sessions(
                 # Orphan: still running but no activity for 24h.
                 if s.started_at and s.started_at < orphan_cutoff:
                     to_orphan_sids.append(s.id)
+            elif s.status == SessionStatus.PENDING:
+                # Fail: stuck in pending for > 2 minutes (runner likely crashed)
+                if s.created_at and s.created_at < pending_cutoff:
+                    to_fail_pending_sids.append(s.id)
 
         if keep_result_only:
             to_prune_sids = [s.id for s in sessions if s.id not in to_drop_sids]
@@ -181,6 +187,20 @@ async def _gc_sessions(
                         metadata={"orphan_reason": "gc: 24h no activity"},
                     )
 
+        if to_fail_pending_sids:
+            verb3 = "would fail pending" if dry_run else "failing pending"
+            console.print(f"[bold]{verb3} {len(to_fail_pending_sids)} session(s)[/bold]")
+            for sid in to_fail_pending_sids:
+                if not dry_run:
+                    await storage.update_session(
+                        sid,
+                        status=SessionStatus.FAILED,
+                        finished_at=now,
+                        metadata={"error": "pending timeout: runner likely crashed before starting"},
+                    )
+                else:
+                    console.print(f"  - {sid}")
+
         if keep_result_only and to_prune_sids and not dry_run:
             pruned_total = 0
             for sid in to_prune_sids:
@@ -191,7 +211,7 @@ async def _gc_sessions(
             console.print("[dim]running VACUUM...[/dim]")
             await storage.vacuum()
 
-        if not (to_drop_sids or to_orphan_sids or to_prune_sids):
+        if not (to_drop_sids or to_orphan_sids or to_prune_sids or to_fail_pending_sids):
             console.print("[green]nothing to gc[/green]")
     finally:
         await storage.close()

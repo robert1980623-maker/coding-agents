@@ -114,3 +114,97 @@ class TestSDKClientTokenFileFallback:
             assert client._token is None
             auth_header = client._client.headers.get("Authorization")
             assert auth_header is None
+
+
+class TestSDKClientDynamicTokenReload:
+    """Regression: SDK client must re-read the token file on each request.
+
+    Previously, the SDK client cached the token at construction time and
+    baked it into static httpx headers. When the server's token file was
+    regenerated (e.g. CLI re-creating a corrupt file), the client would
+    keep sending the stale token and get 401s forever.
+    """
+
+    async def test_client_picks_up_regenerated_token(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        """When the token file is regenerated, subsequent requests use the
+        new token — the client re-reads the file on each request."""
+        import httpx
+
+        # Create a token file with an initial value
+        token_file = tmp_path / "token"
+        original_token = "original-token-abc"
+        token_file.write_text(original_token + "\n")
+        monkeypatch.setattr("coding_agents_sdk.client.DEFAULT_TOKEN_PATH", str(token_file))
+        monkeypatch.delenv("CODING_AGENTS_TOKEN", raising=False)
+        monkeypatch.delenv("CODING_AGENTS_TOKEN_PATH", raising=False)
+
+        from coding_agents_sdk.client import AsyncCodingAgentClient
+
+        # Capture the Authorization header sent on each request
+        captured_auth: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_auth.append(request.headers.get("authorization", ""))
+            return httpx.Response(200, json={"status": "ok"})
+
+        transport = httpx.MockTransport(handler)
+        async with AsyncCodingAgentClient(
+            base_url="http://test",
+            transport=transport,
+        ) as client:
+            # First request: uses the original token
+            await client.health()
+            assert captured_auth[-1] == f"Bearer {original_token}"
+
+            # Simulate the server regenerating the token (e.g. CLI re-creates
+            # a corrupt file). The client must pick up the new token on the
+            # next request without being re-constructed.
+            new_token = "regenerated-token-xyz"
+            token_file.write_text(new_token + "\n")
+
+            # Second request: should use the new token
+            await client.health()
+            assert captured_auth[-1] == f"Bearer {new_token}", (
+                f"Client should have picked up the regenerated token. "
+                f"Expected 'Bearer {new_token}', got {captured_auth[-1]!r}"
+            )
+
+    async def test_client_picks_up_env_var_change(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        """When CODING_AGENTS_TOKEN env var changes, subsequent requests
+        use the new token."""
+        import httpx
+
+        original_token = "env-token-original"
+        monkeypatch.setenv("CODING_AGENTS_TOKEN", original_token)
+        # Point to a non-existent file so env var is the only source
+        nonexistent = tmp_path / "nonexistent-token"
+        monkeypatch.setattr("coding_agents_sdk.client.DEFAULT_TOKEN_PATH", str(nonexistent))
+        monkeypatch.delenv("CODING_AGENTS_TOKEN_PATH", raising=False)
+
+        from coding_agents_sdk.client import AsyncCodingAgentClient
+
+        captured_auth: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_auth.append(request.headers.get("authorization", ""))
+            return httpx.Response(200, json={"status": "ok"})
+
+        transport = httpx.MockTransport(handler)
+        async with AsyncCodingAgentClient(
+            base_url="http://test",
+            transport=transport,
+        ) as client:
+            await client.health()
+            assert captured_auth[-1] == f"Bearer {original_token}"
+
+            # Change the env var
+            new_token = "env-token-changed"
+            monkeypatch.setenv("CODING_AGENTS_TOKEN", new_token)
+
+            await client.health()
+            assert captured_auth[-1] == f"Bearer {new_token}"
+

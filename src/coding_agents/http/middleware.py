@@ -33,6 +33,10 @@ PUBLIC_PATHS: frozenset[str] = frozenset({"/health"})
 # Warn at most once per process about the missing-token dev-mode bypass,
 # so we don't spam the log on every request.
 _dev_mode_warned: bool = False
+# True once a non-empty token has been successfully loaded. After this, a
+# missing token file is treated as broken auth (500), NOT dev mode — this
+# prevents a deleted token file from silently re-enabling dev-mode bypass.
+_token_ever_loaded: bool = False
 
 
 class BearerTokenMiddleware(BaseHTTPMiddleware):
@@ -60,7 +64,7 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
     async def dispatch(
         self, request: Request, call_next: RequestResponseEndpoint
     ) -> Response:
-        global _dev_mode_warned  # noqa: PLW0603 — module-level flag
+        global _dev_mode_warned, _token_ever_loaded  # noqa: PLW0603 — module-level flags
 
         # Public paths bypass auth entirely.
         # Strip trailing slash so /health/ (common from load balancers)
@@ -71,7 +75,7 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
         # Load the stored token from disk on every request.
         #
         # load_token returns:
-        #   None  → file does not exist (dev mode: auth disabled).
+        #   None  → file does not exist.
         #   ""    → file exists but is empty / unreadable (auth BROKEN:
         #           reject rather than silently disable auth — this is
         #           the security-critical distinction).
@@ -82,8 +86,36 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
         # initial token creation (server started before CLI ran once).
         # The TOCTOU window between this read and verify_token's use of
         # request.state is negligible (same request lifecycle).
+        #
+        # Dev-mode vs broken-file distinction for None (file missing):
+        #   - If we have NEVER loaded a valid token, the file may simply
+        #     not exist yet (server started before CLI ran once). Enter
+        #     dev mode with a one-shot warning.
+        #   - If we HAVE loaded a valid token before, the file was deleted
+        #     after the server was running. This is NOT dev mode — it's
+        #     broken auth (someone may have deleted the file to bypass
+        #     auth). Reject with 500 rather than silently re-enabling
+        #     dev-mode bypass.
         stored = load_token(self.token_path)
         if stored is None:
+            if _token_ever_loaded:
+                # File was deleted after we previously loaded a valid token.
+                # This is NOT dev mode — it's broken auth. Reject rather
+                # than silently re-enabling dev-mode bypass.
+                logger.error(
+                    "auth_broken_token_file_missing: Token file was deleted "
+                    "after auth was active — refusing to silently disable "
+                    "auth. Run the coding-agents CLI to regenerate the token."
+                )
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "detail": (
+                            "Auth token file is missing. "
+                            "Regenerate it with the coding-agents CLI."
+                        ),
+                    },
+                )
             if not _dev_mode_warned:
                 logger.warning(
                     "auth_disabled_no_token_file: No token file found — "
@@ -132,6 +164,10 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
             )
 
         provided = parts[1].strip()  # Strip any trailing whitespace
+        # Record that we've loaded a valid token at least once. From now
+        # on, a missing token file is treated as broken auth (500), not
+        # dev mode — prevents silent auth bypass via file deletion.
+        _token_ever_loaded = True
         # Constant-time comparison against the token we already loaded —
         # do NOT call validate_token() here, as that would re-read the
         # file from disk (TOCTOU + wasted I/O).
@@ -152,6 +188,7 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
 
 
 def reset_dev_mode_warning() -> None:
-    """Reset the one-shot dev-mode warning flag (for tests)."""
-    global _dev_mode_warned  # noqa: PLW0603
+    """Reset the one-shot dev-mode warning flag and token-loaded tracker (for tests)."""
+    global _dev_mode_warned, _token_ever_loaded  # noqa: PLW0603
     _dev_mode_warned = False
+    _token_ever_loaded = False
