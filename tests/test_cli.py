@@ -374,3 +374,246 @@ class TestDispatchOutputContract:
         assert result.exit_code != 0
         # Should fail with "no such option"
         assert "no such option" in result.output or "--stream" in result.output
+
+
+class TestVersionCommand:
+    """Test --version flag works correctly."""
+
+    def test_version_flag(self):
+        """`coding-agents --version` should show version and exit 0."""
+        result = runner.invoke(app, ["--version"])
+        assert result.exit_code == 0
+        assert "coding-agents" in result.stdout
+        # Should contain a version string like "0.2.31" or "unknown" (if not installed)
+        assert any(c.isdigit() for c in result.stdout) or "unknown" in result.stdout
+
+    def test_version_short_flag(self):
+        """`coding-agents -v` should also work."""
+        result = runner.invoke(app, ["-v"])
+        assert result.exit_code == 0
+        assert "coding-agents" in result.stdout
+
+
+class TestAutoCleanupPoll:
+    """Test auto-cleanup in poll command."""
+
+    def test_auto_clean_enabled_by_default(self, mock_db: Path):
+        """poll should auto-clean stuck sessions by default."""
+        import asyncio
+        from datetime import datetime, timedelta, timezone
+
+        async def _setup():
+            store = SQLiteStorage(mock_db)
+            await store.initialize()
+            now = datetime.now(timezone.utc)
+            # Create a pending session 3 minutes ago (should be auto-failed)
+            session = Session(
+                agent=AgentType.CLAUDE,
+                prompt="test",
+                workdir="/tmp",
+                status=SessionStatus.PENDING,
+                created_at=now - timedelta(minutes=3),
+            )
+            await store.create_session(session)
+            await store.close()
+            return session.id
+
+        sid = asyncio.run(_setup())
+
+        # poll with default --auto-clean should fail the pending session
+        result = runner.invoke(app, ["poll", "--format", "json"])
+        assert result.exit_code == 0
+        assert "Auto-cleaned" in result.stdout or "auto-cleaned" in result.stdout.lower()
+
+        # Verify the session was marked as failed
+        async def check():
+            s = SQLiteStorage(mock_db)
+            await s.initialize()
+            sess = await s.get_session(sid)
+            await s.close()
+            return sess.status if sess else None
+
+        status = asyncio.run(check())
+        assert status == SessionStatus.FAILED
+
+    def test_no_auto_clean_flag(self, mock_db: Path):
+        """poll with --no-auto-clean should not clean stuck sessions."""
+        import asyncio
+        from datetime import datetime, timedelta, timezone
+
+        async def _setup():
+            store = SQLiteStorage(mock_db)
+            await store.initialize()
+            now = datetime.now(timezone.utc)
+            session = Session(
+                agent=AgentType.CLAUDE,
+                prompt="test",
+                workdir="/tmp",
+                status=SessionStatus.PENDING,
+                created_at=now - timedelta(minutes=3),
+            )
+            await store.create_session(session)
+            await store.close()
+            return session.id
+
+        sid = asyncio.run(_setup())
+
+        # poll with --no-auto-clean should NOT fail the pending session
+        result = runner.invoke(app, ["poll", "--format", "json", "--no-auto-clean"])
+        assert result.exit_code == 0
+
+        # Verify session is still pending
+        async def check():
+            s = SQLiteStorage(mock_db)
+            await s.initialize()
+            sess = await s.get_session(sid)
+            await s.close()
+            return sess.status if sess else None
+
+        status = asyncio.run(check())
+        assert status == SessionStatus.PENDING
+
+
+class TestAutoCleanupStatus:
+    """Test auto-cleanup in status command."""
+
+    def test_status_auto_clean_stuck_pending(self, mock_db: Path):
+        """status should auto-clean stuck pending sessions."""
+        import asyncio
+        from datetime import datetime, timedelta, timezone
+
+        async def _setup():
+            store = SQLiteStorage(mock_db)
+            await store.initialize()
+            now = datetime.now(timezone.utc)
+            session = Session(
+                agent=AgentType.CLAUDE,
+                prompt="test",
+                workdir="/tmp",
+                status=SessionStatus.PENDING,
+                created_at=now - timedelta(minutes=3),
+            )
+            await store.create_session(session)
+            await store.close()
+            return session.id
+
+        sid = asyncio.run(_setup())
+
+        # status should auto-clean the stuck session
+        result = runner.invoke(app, ["status", sid])
+        assert result.exit_code == 0
+        assert "cleaned up" in result.stdout.lower()
+
+        # Verify session was marked as failed
+        async def check():
+            s = SQLiteStorage(mock_db)
+            await s.initialize()
+            sess = await s.get_session(sid)
+            await s.close()
+            return sess.status if sess else None
+
+        status = asyncio.run(check())
+        assert status == SessionStatus.FAILED
+
+    def test_status_no_auto_clean(self, mock_db: Path):
+        """status with --no-auto-clean should not clean stuck sessions."""
+        import asyncio
+        from datetime import datetime, timedelta, timezone
+
+        async def _setup():
+            store = SQLiteStorage(mock_db)
+            await store.initialize()
+            now = datetime.now(timezone.utc)
+            session = Session(
+                agent=AgentType.CLAUDE,
+                prompt="test",
+                workdir="/tmp",
+                status=SessionStatus.PENDING,
+                created_at=now - timedelta(minutes=3),
+            )
+            await store.create_session(session)
+            await store.close()
+            return session.id
+
+        sid = asyncio.run(_setup())
+
+        # status with --no-auto-clean should NOT fail the session
+        result = runner.invoke(app, ["status", sid, "--no-auto-clean"])
+        assert result.exit_code == 0
+
+        # Verify session is still pending
+        async def check():
+            s = SQLiteStorage(mock_db)
+            await s.initialize()
+            sess = await s.get_session(sid)
+            await s.close()
+            return sess.status if sess else None
+
+        status = asyncio.run(check())
+        assert status == SessionStatus.PENDING
+
+    def test_status_quiet_flag(self, mock_db: Path):
+        """status with --quiet should suppress cleanup message."""
+        import asyncio
+        from datetime import datetime, timedelta, timezone
+
+        async def _setup():
+            store = SQLiteStorage(mock_db)
+            await store.initialize()
+            now = datetime.now(timezone.utc)
+            session = Session(
+                agent=AgentType.CLAUDE,
+                prompt="test",
+                workdir="/tmp",
+                status=SessionStatus.PENDING,
+                created_at=now - timedelta(minutes=3),
+            )
+            await store.create_session(session)
+            await store.close()
+            return session.id
+
+        sid = asyncio.run(_setup())
+
+        # status with --quiet should not show cleanup message
+        result = runner.invoke(app, ["status", sid, "--quiet"])
+        assert result.exit_code == 0
+        assert "cleaned up" not in result.stdout.lower()
+
+    def test_status_auto_clean_orphaned_running(self, mock_db: Path):
+        """status should auto-clean running sessions with no heartbeat > 24h."""
+        import asyncio
+        from datetime import datetime, timedelta, timezone
+
+        async def _setup():
+            store = SQLiteStorage(mock_db)
+            await store.initialize()
+            now = datetime.now(timezone.utc)
+            session = Session(
+                agent=AgentType.CLAUDE,
+                prompt="test",
+                workdir="/tmp",
+                status=SessionStatus.RUNNING,
+                started_at=now - timedelta(hours=25),
+                last_heartbeat_at=now - timedelta(hours=25),
+            )
+            await store.create_session(session)
+            await store.close()
+            return session.id
+
+        sid = asyncio.run(_setup())
+
+        # status should auto-clean the orphaned session
+        result = runner.invoke(app, ["status", sid])
+        assert result.exit_code == 0
+        assert "cleaned up" in result.stdout.lower()
+
+        # Verify session was marked as orphaned
+        async def check():
+            s = SQLiteStorage(mock_db)
+            await s.initialize()
+            sess = await s.get_session(sid)
+            await s.close()
+            return sess.status if sess else None
+
+        status = asyncio.run(check())
+        assert status == SessionStatus.ORPHANED

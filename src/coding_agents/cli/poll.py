@@ -38,6 +38,15 @@ def poll(
         help="Output format: table (default) or json.",
     ),
     limit: int = typer.Option(20, "--limit", "-n", help="Max sessions to show."),
+    auto_clean: bool = typer.Option(
+        True, "--auto-clean/--no-auto-clean",
+        help="Automatically clean stuck sessions (pending > 2min -> failed, "
+             "running > 24h no heartbeat -> orphaned) before showing results.",
+    ),
+    quiet: bool = typer.Option(
+        False, "--quiet",
+        help="Suppress auto-cleanup summary report.",
+    ),
 ) -> None:
     """Poll all active sessions — one-line status overview per session.
 
@@ -45,9 +54,13 @@ def poll(
     how long they've been running, and whether they appear stuck
     (no heartbeat for --stuck-after). Designed for the PM agent to
     check fleet health with a single command instead of N list+tail calls.
+
+    Auto-cleans stuck sessions by default:
+    - pending sessions > 2min are marked as failed
+    - running sessions with no heartbeat > 24h are marked as orphaned
     """
     from coding_agents.cli._utils import _run_async
-    _run_async(_poll_sessions(all, status, stuck_after, format, limit))
+    _run_async(_poll_sessions(all, status, stuck_after, format, limit, auto_clean, quiet))
 
 
 async def _poll_sessions(
@@ -56,6 +69,8 @@ async def _poll_sessions(
     stuck_after_str: str,
     format_str: str,
     limit: int,
+    auto_clean: bool,
+    quiet: bool,
 ) -> None:
     from coding_agents.cli._utils import (
         _format_duration,
@@ -69,6 +84,20 @@ async def _poll_sessions(
     storage = _get_storage()
     await storage.initialize()
     try:
+        # Auto-cleanup: mark stuck sessions before polling
+        pending_failed = 0
+        running_orphaned = 0
+        if auto_clean:
+            pending_failed = await storage.recover_pending_sessions(timeout_seconds=120)
+            running_orphaned = await storage.recover_orphaned_sessions(timeout_seconds=86400)
+
+        # Report cleanup results (unless quiet or nothing happened)
+        if auto_clean and not quiet and (pending_failed > 0 or running_orphaned > 0):
+            console.print(
+                f"[dim]Auto-cleaned: {pending_failed} pending → failed, "
+                f"{running_orphaned} running → orphaned[/dim]"
+            )
+
         # Resolve status filter.
         # Explicit --status wins; then --all; default = active only.
         if status_filter:

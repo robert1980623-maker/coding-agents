@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import sys
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import typer
@@ -38,14 +39,27 @@ def status(
         False, "--no-events",
         help="Skip events, show only session metadata.",
     ),
+    auto_clean: bool = typer.Option(
+        True, "--auto-clean/--no-auto-clean",
+        help="Automatically clean stuck sessions (pending > 2min -> failed, "
+             "running > 24h no heartbeat -> orphaned) if the queried session is stuck.",
+    ),
+    quiet: bool = typer.Option(
+        False, "--quiet",
+        help="Suppress auto-cleanup summary report.",
+    ),
 ) -> None:
     """Show session metadata + the most recent events.
 
     By default prints the last 20 events (oldest-first within the window).
     Use `tail` if you want a longer or full stream.
+
+    Auto-cleans stuck sessions by default:
+    - pending sessions > 2min are marked as failed
+    - running sessions with no heartbeat > 24h are marked as orphaned
     """
     from coding_agents.cli._utils import _run_async
-    _run_async(_show_status(session_id, limit, no_events))
+    _run_async(_show_status(session_id, limit, no_events, auto_clean, quiet))
 
 
 def tail_cmd(
@@ -139,8 +153,15 @@ def _print_session(session: Session, tags: list[str]) -> None:
         console.print(f"  Tags: {', '.join(tags)}")
 
 
-async def _show_status(session_id: str, limit: int, no_events: bool) -> None:
+async def _show_status(
+    session_id: str,
+    limit: int,
+    no_events: bool,
+    auto_clean: bool,
+    quiet: bool,
+) -> None:
     from coding_agents.cli._utils import _get_storage, console
+    from coding_agents.models import SessionStatus
     storage = _get_storage()
     await storage.initialize()
     try:
@@ -148,6 +169,43 @@ async def _show_status(session_id: str, limit: int, no_events: bool) -> None:
         if session is None:
             console.print(f"[red]Session not found: {session_id}[/red]")
             raise typer.Exit(code=1)
+
+        # Auto-cleanup for the queried session if it's stuck
+        cleaned = False
+        if auto_clean and not session.status.is_terminal:
+            now = datetime.now(timezone.utc)
+
+            # Check if pending session is stuck (> 2min)
+            if session.status == SessionStatus.PENDING:
+                if session.created_at:
+                    pending_cutoff = now - timedelta(seconds=120)
+                    if session.created_at < pending_cutoff:
+                        await storage.recover_pending_sessions(timeout_seconds=120)
+                        cleaned = True
+
+            # Check if running session is orphaned (> 24h no heartbeat)
+            elif session.status == SessionStatus.RUNNING:
+                if session.last_heartbeat_at:
+                    orphan_cutoff = now - timedelta(hours=24)
+                    if session.last_heartbeat_at < orphan_cutoff:
+                        await storage.recover_orphaned_sessions(timeout_seconds=86400)
+                        cleaned = True
+                elif session.started_at:
+                    orphan_cutoff = now - timedelta(hours=24)
+                    if session.started_at < orphan_cutoff:
+                        await storage.recover_orphaned_sessions(timeout_seconds=86400)
+                        cleaned = True
+
+        # Re-fetch session after cleanup
+        session = await storage.get_session(session_id)
+        if session is None:
+            console.print(f"[red]Session not found: {session_id}[/red]")
+            raise typer.Exit(code=1)
+
+        # Report cleanup if it happened
+        if cleaned and not quiet:
+            console.print(f"[dim]Session {session_id} was stuck, automatically cleaned up[/dim]")
+
         tags = await storage.list_tags(session_id)
         _print_session(session, tags)
         if not no_events:

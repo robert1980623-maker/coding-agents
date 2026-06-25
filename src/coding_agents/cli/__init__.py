@@ -16,6 +16,7 @@ from rich.console import Console
 
 from coding_agents.auth import ensure_token, get_token_path
 from coding_agents.logging_config import setup_logging
+from coding_agents._version import __version__
 
 # Re-export factory functions for backward compatibility with tests that
 # mock via ``patch("coding_agents.cli.get_agent", ...)``.
@@ -37,6 +38,7 @@ app = typer.Typer(
     name="coding-agents",
     help="A unified runtime for managing coding agents (Claude Code, Codex, etc.)",
     no_args_is_help=True,
+    invoke_without_command=True,
 )
 console = Console()
 
@@ -51,8 +53,19 @@ def _global_options(
         help="Path to auth token file (default: ~/.coding-agents-token). "
         "Auto-generated on first run if missing.",
     ),
+    version: Optional[bool] = typer.Option(
+        None, "--version", "-v",
+        help="Show version and exit.",
+        is_eager=True,
+    ),
 ) -> None:
     """Global options for all commands."""
+    # Handle --version flag
+    if version is True:
+        from rich import print as rich_print
+        rich_print(f"coding-agents [bold]{__version__}[/bold]")
+        raise typer.Exit()
+
     setup_logging(level=log_level, json_output=log_json)
     # Ensure auth token is available.
     # In Phase 1 we just materialize the token; Phase 2 HTTP server will validate it.
